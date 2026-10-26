@@ -1,24 +1,3 @@
-// ============================================================================
-//  MATHS SOLVER SYSTEM  -  GUI เครื่องคิดเลขแบบมีปุ่มกด (Linux / X11)  [แก้เฉพาะ main.cpp]
-//
-//  ฟีเจอร์ครบเหมือนเวอร์ชัน terminal (menu.cpp) ทั้ง 7 หมวด:
-//   [1] Algebra Calculator  - คำนวณต่อเนื่อง + ans + ประวัติ (คลิกประวัติเพื่อเรียกกลับมาแก้)
-//   [2] Calculus Solver     - อนุพันธ์/ปริพันธ์/ลิมิต (ตัวเลข+สัญลักษณ์)
-//   [3] Alpha Equation      - พหุนาม, แยกตัวประกอบ, f(x)=0, สมการอนุพันธ์/อินทิกรัล/ลิมิต, lhs=rhs,
-//                             ระบบสมการเชิงเส้น/ไม่เชิงเส้น (กี่สมการ กี่ตัวแปรก็ได้)
-//   [4] 2D Graph Plotter    - 9 แบบ + ซูมเข้า/ออก/เลื่อน/ตั้งช่วง x/ความละเอียด
-//   [5] Multi-Matrix        - เมทริกซ์ N ตัว ขนาด n x m (สูงสุด 12 x 12) บวก/ลบ/คูณ N ตัว, transpose,
-//                             det, inverse, อนุพันธ์/ปริพันธ์ทีละสมาชิก, แก้ AX=B, เก็บผลลัพธ์เป็นเมทริกซ์ใหม่
-//   [6] Table & Probability - ตารางข้อมูล+สถิติ, binomial/poisson/Z table, ตัวคำนวณการแจกแจง, nCr/nPr, joint table
-//   [7] Relations/Functions - Cartesian N เซต, relation, domain/range, 1-1/onto, f+g, g∘f, inverse, f(x+h)
-//
-//  ใช้งานง่าย: คลิกการ์ด/เมนู, ช่องกรอกมีป้ายชื่อ+ตัวอย่าง, ปุ่ม "Example" เติมตัวอย่างให้,
-//  แผงปุ่มคณิตศาสตร์แทรกลงช่องที่เลือก, Tab = ช่องถัดไป, Enter = คำนวณ, Esc = ย้อนกลับ,
-//  ล้อเมาส์/PgUp/PgDn = เลื่อนผลลัพธ์
-//
-//  Build:  sudo apt install libx11-dev
-//          g++ -std=c++17 *.cpp -o calc -lX11      (หรือใช้ CMakeLists.txt)
-// ============================================================================
 #include "lib/algebra.hpp"
 #include "lib/Alpha_solver_eq.hpp"
 #include "lib/Calculator_calculus.hpp"
