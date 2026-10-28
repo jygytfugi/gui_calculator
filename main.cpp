@@ -1,3 +1,24 @@
+// ============================================================================
+//  MATHS SOLVER SYSTEM  -  GUI เครื่องคิดเลขแบบมีปุ่มกด (Linux / X11)  [แก้เฉพาะ main.cpp]
+//
+//  ฟีเจอร์ครบเหมือนเวอร์ชัน terminal (menu.cpp) ทั้ง 7 หมวด:
+//   [1] Algebra Calculator  - คำนวณต่อเนื่อง + ans + ประวัติ (คลิกประวัติเพื่อเรียกกลับมาแก้)
+//   [2] Calculus Solver     - อนุพันธ์/ปริพันธ์/ลิมิต (ตัวเลข+สัญลักษณ์)
+//   [3] Alpha Equation      - พหุนาม, แยกตัวประกอบ, f(x)=0, สมการอนุพันธ์/อินทิกรัล/ลิมิต, lhs=rhs,
+//                             ระบบสมการเชิงเส้น/ไม่เชิงเส้น (กี่สมการ กี่ตัวแปรก็ได้)
+//   [4] 2D Graph Plotter    - 9 แบบ + ซูมเข้า/ออก/เลื่อน/ตั้งช่วง x/ความละเอียด
+//   [5] Multi-Matrix        - เมทริกซ์ N ตัว ขนาด n x m (สูงสุด 12 x 12) บวก/ลบ/คูณ N ตัว, transpose,
+//                             det, inverse, อนุพันธ์/ปริพันธ์ทีละสมาชิก, แก้ AX=B, เก็บผลลัพธ์เป็นเมทริกซ์ใหม่
+//   [6] Table & Probability - ตารางข้อมูล+สถิติ, binomial/poisson/Z table, ตัวคำนวณการแจกแจง, nCr/nPr, joint table
+//   [7] Relations/Functions - Cartesian N เซต, relation, domain/range, 1-1/onto, f+g, g∘f, inverse, f(x+h)
+//
+//  ใช้งานง่าย: คลิกการ์ด/เมนู, ช่องกรอกมีป้ายชื่อ+ตัวอย่าง, ปุ่ม "Example" เติมตัวอย่างให้,
+//  แผงปุ่มคณิตศาสตร์แทรกลงช่องที่เลือก, Tab = ช่องถัดไป, Enter = คำนวณ, Esc = ย้อนกลับ,
+//  ล้อเมาส์/PgUp/PgDn = เลื่อนผลลัพธ์
+//
+//  Build:  sudo apt install libx11-dev
+//          g++ -std=c++17 *.cpp -o calc -lX11      (หรือใช้ CMakeLists.txt)
+// ============================================================================
 #include "lib/algebra.hpp"
 #include "lib/Alpha_solver_eq.hpp"
 #include "lib/Calculator_calculus.hpp"
@@ -807,31 +828,75 @@ static void BuildCatalog() {
             {TF("f(x)", "e.g. sqrt(x-2)   or   1/(x+1)")},
             [](Feature& f) -> std::string { return g_fs.describeFunction(Req(f, 0)); },
             {{"sqrt(x-2)"}, {"1/(x+1)"}, {"x^2"}}));
-        c.features.push_back(MkF("Algebra of Functions  (f+g, f-g, fg, f/g)", "Combine two functions.",
-            {TF("f(x)", "e.g. x^2"), TF("g(x)", "e.g. x - 1")},
-            [](Feature& f) -> std::string {
-                std::string a = Req(f, 0), b = Req(f, 1);
-                struct It { const char* n; std::string e; };
-                std::vector<It> items = {{"f+g", g_fs.add(a, b)}, {"f-g", g_fs.subtract(a, b)},
-                                         {"f*g", g_fs.multiply(a, b)}, {"f/g", g_fs.divide(a, b)}};
-                std::string t;
-                for (auto& it : items) {
-                    t += std::string(it.n) + " (x) = " + it.e + "\n";
-                    try { t += "     Domain = " + FunctionSolver::toString(g_fs.domain(it.e)) + "\n"; } catch (...) {}
-                }
-                return t;
-            }, {{"x^2", "x-1"}}));
-        c.features.push_back(MkF("Composite Functions  (g o f, f o g)", "g(f(x)) and f(g(x)).",
-            {TF("f(x)", "e.g. 2x + 1"), TF("g(x)", "e.g. x^2")},
-            [](Feature& f) -> std::string {
-                std::string a = Req(f, 0), b = Req(f, 1);
-                std::string gf = g_fs.compose(b, a), fg = g_fs.compose(a, b);
-                std::string t = "(g o f)(x) = g(f(x)) = " + gf + "\n";
-                try { t += "     Domain = " + FunctionSolver::toString(g_fs.domain(gf)) + "\n"; } catch (...) {}
-                t += "(f o g)(x) = f(g(x)) = " + fg + "\n";
-                try { t += "     Domain = " + FunctionSolver::toString(g_fs.domain(fg)) + "\n"; } catch (...) {}
-                return t;
-            }, {{"2x+1", "x^2"}}));
+        {
+            Feature f = MkF("Algebra of Functions  (N functions)",
+                "Combine any number of functions with one operation, left to right. Use [+ Add Function] for more.",
+                {CF("Operation", {"f1 + f2 + ...", "f1 - f2 - ...", "f1 * f2 * ...", "f1 / f2 / ..."}),
+                 TF("Function 1", "e.g. x^2"), TF("Function 2", "e.g. x - 1")},
+                [](Feature& f) -> std::string {
+                    std::vector<std::string> fs;
+                    for (size_t i = 1; i < f.fields.size(); ++i) { std::string s = ReplaceAns(Trim(f.fields[i].value)); if (!s.empty()) fs.push_back(s); }
+                    if (fs.size() < 2) throw std::runtime_error("Please enter at least 2 functions");
+                    int op = Pick(f, 0);
+                    const char* sym[] = {" + ", " - ", " * ", " / "};
+                    std::string cur = fs[0], label = "f1", t;
+                    for (size_t k = 1; k < fs.size(); ++k) {
+                        const std::string& g = fs[k];
+                        cur = op == 0 ? g_fs.add(cur, g) : op == 1 ? g_fs.subtract(cur, g) : op == 2 ? g_fs.multiply(cur, g) : g_fs.divide(cur, g);
+                        label += sym[op] + ("f" + std::to_string(k + 1));
+                        t += "Step " + std::to_string(k) + ":  " + label + "  =  " + cur + "\n";
+                    }
+                    t += "\nResult  h(x) = " + cur + "\n";
+                    try { t += "Domain = " + FunctionSolver::toString(g_fs.domain(cur)) + "\n"; } catch (...) {}
+                    try { t += "Range  = " + FunctionSolver::toString(g_fs.range(cur)) + "\n"; } catch (...) {}
+                    return t;
+                }, {{"0", "x^2", "x-1"}, {"2", "x", "x+1", "x-2"}, {"3", "x^2-1", "x-1"}});
+            f.dynLabel = "Function"; f.dynStart = 1; f.dynMin = 2; f.dynMax = 8;
+            c.features.push_back(f);
+        }
+        {
+            Feature f = MkF("Composite Functions  (N functions)",
+                "Compose any number of functions. Use [+ Add Function] for more. Both orders are shown.",
+                {CF("Order shown first", {"f1 applied first:  fn(...f2(f1(x)))", "fn applied first:  f1(f2(...fn(x)))"}),
+                 TF("Function 1", "e.g. 2x + 1"), TF("Function 2", "e.g. x^2")},
+                [](Feature& f) -> std::string {
+                    std::vector<std::string> fs;
+                    for (size_t i = 1; i < f.fields.size(); ++i) { std::string s = ReplaceAns(Trim(f.fields[i].value)); if (!s.empty()) fs.push_back(s); }
+                    if (fs.size() < 2) throw std::runtime_error("Please enter at least 2 functions");
+                    int n = (int)fs.size();
+                    auto build = [&](bool firstApplied, std::string& steps) -> std::string {
+                        std::string cur, name;
+                        if (firstApplied) {                       // fn( ... f2( f1(x) ) )
+                            cur = fs[0]; name = "f1(x)";
+                            for (int k = 1; k < n; ++k) {
+                                cur = g_fs.compose(fs[k], cur);
+                                name = "f" + std::to_string(k + 1) + "(" + name + ")";
+                                steps += "  " + name + "  =  " + cur + "\n";
+                            }
+                        } else {                                  // f1( f2( ... fn(x) ) )
+                            cur = fs[n - 1]; name = "f" + std::to_string(n) + "(x)";
+                            for (int k = n - 2; k >= 0; --k) {
+                                cur = g_fs.compose(fs[k], cur);
+                                name = "f" + std::to_string(k + 1) + "(" + name + ")";
+                                steps += "  " + name + "  =  " + cur + "\n";
+                            }
+                        }
+                        return cur;
+                    };
+                    std::string t;
+                    for (int pass = 0; pass < 2; ++pass) {
+                        bool firstApplied = (Pick(f, 0) == 0) == (pass == 0);
+                        std::string steps;
+                        std::string cur = build(firstApplied, steps);
+                        t += std::string(pass == 0 ? "=== " : "\n=== ") + (firstApplied ? "f1 applied first" : "fn applied first") + " ===\n" + steps;
+                        t += "Result = " + cur + "\n";
+                        try { t += "Domain = " + FunctionSolver::toString(g_fs.domain(cur)) + "\n"; } catch (...) {}
+                    }
+                    return t;
+                }, {{"0", "2x+1", "x^2"}, {"0", "x+1", "x^2", "sqrt(x)"}, {"1", "x-1", "2x", "x^3"}});
+            f.dynLabel = "Function"; f.dynStart = 1; f.dynMin = 2; f.dynMax = 8;
+            c.features.push_back(f);
+        }
         c.features.push_back(MkF("Inverse Function  f^-1", "Formula (linear f) and numeric f^-1(y0).",
             {TF("f(x)", "e.g. 3x - 6"), TF("y0  (optional, find f^-1(y0))", "e.g. 9")},
             [](Feature& f) -> std::string {
