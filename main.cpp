@@ -1,4 +1,4 @@
-//          g++ -std=c++17 src/*.cpp -o calc -lX11      
+//          g++ -std=c++17 *.cpp -o calc -lX11      
 #include "lib/algebra.hpp"
 #include "lib/Alpha_solver_eq.hpp"
 #include "lib/Calculator_calculus.hpp"
@@ -449,24 +449,217 @@ static std::vector<double> ParseSet(const std::string& s) {
 }
 
 // ---------- กราฟ ----------
-static std::string g_gxMinS = "-10", g_gxMaxS = "10", g_gwS, g_ghS;
-static std::string GraphOut(const std::function<void(MathGraph&, double, double)>& fn) {
-    double x0 = EvalNum(g_gxMinS.empty() ? "-10" : g_gxMinS), x1 = EvalNum(g_gxMaxS.empty() ? "10" : g_gxMaxS);
-    if (!(x0 < x1)) throw std::runtime_error("xMin must be less than xMax");
-    int W = g_gwS.empty() ? std::max(20, g_resCols - 3) : (int)EvalNum(g_gwS);
-    int H = g_ghS.empty() ? std::max(8, g_resRows - 6) : (int)EvalNum(g_ghS);
-    W = std::clamp(W, 20, 300); H = std::clamp(H, 8, 120);
-    MathGraph g(W, H);
-    std::string out;
-    {
-        CoutCapture cap;
-        try { fn(g, x0, x1); }
-        catch (const std::exception& e) { cap.ss << "[Error] " << e.what() << "\n"; }
-        out = cap.ss.str();
+// โหมด Y อัตโนมัติ  -> ใช้ MathGraph (ผลเหมือน terminal)
+// โหมด Y กำหนดเอง  -> วาดด้วย Canvas ภายในไฟล์นี้ เพื่อให้เลื่อนขึ้น/ลง/ซูมแกน y ได้
+enum PlotKind { GK_FUNC, GK_DERIV, GK_INTEG, GK_LIMIT, GK_INDEF, GK_AREA2, GK_INVERSE, GK_SCATTER };
+struct PlotSpec {
+    int kind = GK_FUNC;
+    std::string e1, e2, title;
+    double a = 0, b = 0;
+    DataTable table;
+    int xc = 0, yc = 1;
+};
+struct GView {
+    std::string xmin, xmax, ymin, ymax, w, h;       // ช่องว่าง = อัตโนมัติ
+    double cx0 = -10, cx1 = 10, cy0 = -1, cy1 = 1;   // ช่วงที่แสดงอยู่จริงในภาพล่าสุด
+    std::string defX0, defX1;                       // ค่าเมื่อกด Reset
+};
+static GView MakeView(const char* a, const char* b) { GView v; v.xmin = a; v.xmax = b; v.defX0 = a; v.defX1 = b; return v; }
+static GView g_gv = MakeView("-10", "10");
+static GView g_gvScatter = MakeView("", "");
+
+struct Canvas {
+    int W, H; double x0, x1, y0, y1;
+    std::vector<std::string> g;
+    Canvas(int w, int h, double xa, double xb, double ya, double yb)
+        : W(w), H(h), x0(xa), x1(xb), y0(ya), y1(yb), g(h, std::string(w, ' ')) {}
+    int col(double x) const { return (int)std::clamp((x - x0) / (x1 - x0) * (W - 1), -1e6, 1e6); }
+    int row(double y) const { return H - 1 - (int)std::clamp((y - y0) / (y1 - y0) * (H - 1), -1e6, 1e6); }
+    bool inX(double x) const { return x >= x0 && x <= x1; }
+    bool inY(double y) const { return y >= y0 && y <= y1; }
+    void set(int c, int r, char ch) { if (c >= 0 && c < W && r >= 0 && r < H) g[r][c] = ch; }
+    void mark(double x, double y, char ch) { if (inX(x) && inY(y)) set(col(x), row(y), ch); }
+    void markBlank(double x, double y, char ch) {
+        if (!(inX(x) && inY(y))) return;
+        int c = col(x), r = row(y);
+        if (c >= 0 && c < W && r >= 0 && r < H && g[r][c] == ' ') g[r][c] = ch;
     }
-    return CleanAscii(out);
+    void fill(int c, double ya, double yb, char ch) {
+        int ra = row(ya), rb = row(yb);
+        int lo = std::max(0, std::min(ra, rb)), hi = std::min(H - 1, std::max(ra, rb));
+        for (int r = lo; r <= hi; ++r) set(c, r, ch);
+    }
+    void axes() {
+        bool zr = inY(0.0), zc = inX(0.0);
+        if (zr) for (int c = 0; c < W; ++c) set(c, row(0.0), '-');
+        if (zc) for (int r = 0; r < H; ++r) set(col(0.0), r, '|');
+        if (zr && zc) set(col(0.0), row(0.0), '+');
+    }
+    std::string render(const std::string& title) const {
+        std::ostringstream o;
+        o << "\n--- ASCII High-Res Graph (" << W << "x" << H << "): " << title << " ---\n";
+        for (auto& r : g) o << r << "\n";
+        o << "x Range: [" << x0 << " to " << x1 << "], y Range: [" << y0 << " to " << y1 << "]\n\n";
+        return o.str();
+    }
+};
+static bool EvalAt(const std::string& e, double x, double& y) {
+    try { g_calc.setVariable('x', x); y = g_calc.evaluate(e); return std::isfinite(y) && std::fabs(y) < 1e5; }
+    catch (...) { return false; }
 }
-static void GraphSetRange(double x0, double x1) { g_gxMinS = Fmt(x0); g_gxMaxS = Fmt(x1); }
+static std::string CustomRender(const PlotSpec& s, int W, int H, double x0, double x1, double y0, double y1) {
+    Canvas c(W, H, x0, x1, y0, y1);
+    c.axes();
+    double dx = (x1 - x0) / (W - 1);
+    std::string title, footer;
+    auto tgt = [](double v) { return std::isinf(v) ? (v > 0 ? std::string("inf") : std::string("-inf")) : Fmt(v); };
+    switch (s.kind) {
+    case GK_FUNC: {
+        title = "f(x) = " + s.e1;
+        for (int i = 0; i < W; ++i) { double x = x0 + i * dx, y; if (EvalAt(s.e1, x, y)) c.mark(x, y, '*'); }
+        break; }
+    case GK_DERIV: {
+        double slope = g_calc.derivative(s.e1, s.a);
+        g_calc.setVariable('x', s.a);
+        double ya = g_calc.evaluate(s.e1);
+        title = "f(x) = " + s.e1 + " | Tangent at x=" + Fmt(s.a);
+        for (int i = 0; i < W; ++i) {
+            double x = x0 + i * dx, y;
+            if (!EvalAt(s.e1, x, y)) continue;
+            c.mark(x, slope * (x - s.a) + ya, '/');
+            c.mark(x, y, '*');
+        }
+        c.mark(s.a, ya, 'O');
+        footer = " Slope m (d/dx at x=" + Fmt(s.a) + ") = " + Fmt(slope) + "\n";
+        break; }
+    case GK_INTEG: {
+        double area = g_calc.integral(s.e1, s.a, s.b);
+        double pa = std::isinf(s.a) ? (s.a < 0 ? x0 : x1) : s.a, pb = std::isinf(s.b) ? (s.b < 0 ? x0 : x1) : s.b;
+        if (pa > pb) std::swap(pa, pb);
+        title = "Integral Area of f(x) over [" + tgt(s.a) + ", " + tgt(s.b) + "]";
+        for (int i = 0; i < W; ++i) {
+            double x = x0 + i * dx, y;
+            if (!EvalAt(s.e1, x, y)) continue;
+            if (x >= pa && x <= pb) c.fill(i, y, 0.0, '#');
+            c.mark(x, y, '*');
+        }
+        footer = " Definite Integral (Area) = " + Fmt(area) + "\n";
+        break; }
+    case GK_AREA2: {
+        double a = std::min(s.a, s.b), b = std::max(s.a, s.b), area = 0; bool has = true;
+        try { area = g_calc.integral("abs((" + s.e1 + ")-(" + s.e2 + "))", a, b); } catch (...) { has = false; }
+        title = "Area between f1(x)=[*] " + s.e1 + " and f2(x)=[~] " + s.e2;
+        for (int i = 0; i < W; ++i) {
+            double x = x0 + i * dx, v1, v2;
+            if (!EvalAt(s.e1, x, v1) || !EvalAt(s.e2, x, v2)) continue;
+            if (x >= a && x <= b) c.fill(i, v1, v2, '#');
+            c.mark(x, v1, '*'); c.mark(x, v2, '~');
+        }
+        footer = has ? " Enclosed Area over [" + Fmt(a) + ", " + Fmt(b) + "] = " + Fmt(area) + "\n" : " [Error] Unable to compute enclosed area\n";
+        break; }
+    case GK_LIMIT: {
+        double lim = 0; bool has = true; std::string status;
+        try { lim = g_calc.limit(s.e1, s.a); status = "lim (x->" + tgt(s.a) + ") = " + tgt(lim); }
+        catch (const std::exception& e) { has = false; status = std::string("Limit undefined/does not exist (") + e.what() + ")"; }
+        title = "Limit Plot of f(x) at x -> " + tgt(s.a);
+        if (!std::isinf(s.a) && c.inX(s.a)) {
+            int cc = c.col(s.a);
+            for (int r = 0; r < H; ++r) if (c.g[r][cc] == ' ') c.g[r][cc] = ':';
+            if (has && !std::isinf(lim) && c.inY(lim)) c.set(cc, c.row(lim), 'O');
+        }
+        for (int i = 0; i < W; ++i) { double x = x0 + i * dx, y; if (EvalAt(s.e1, x, y)) c.mark(x, y, '*'); }
+        footer = " Result: " + status + "\n";
+        break; }
+    case GK_INDEF: {
+        title = "f(x) [*] vs Indefinite Integral F(x) [I] (ref=" + Fmt(s.a) + ")";
+        for (int i = 0; i < W; ++i) {
+            double x = x0 + i * dx;
+            try {
+                g_calc.setVariable('x', x);
+                double y = g_calc.evaluate(s.e1);
+                double F = g_calc.integral(s.e1, s.a, x);
+                if (std::isfinite(y) && std::isfinite(F)) { c.mark(x, F, 'I'); c.mark(x, y, '*'); }
+            } catch (...) {}
+        }
+        break; }
+    case GK_INVERSE: {
+        title = "f(x)=[*] " + s.e1 + "   f^-1(x)=[o]   y=x [.]";
+        for (int i = 0; i < W; ++i) { double x = x0 + i * dx; c.markBlank(x, x, '.'); }
+        int samples = std::max(W, H) * 8;
+        std::vector<std::pair<double, double>> pts;
+        for (int i = 0; i <= samples; ++i) { double t = x0 + (x1 - x0) * i / samples, y; if (EvalAt(s.e1, t, y)) pts.emplace_back(t, y); }
+        for (auto& p : pts) c.mark(p.first, p.second, '*');
+        for (auto& p : pts) c.mark(p.second, p.first, 'o');
+        try {
+            if (g_fs.isOneToOne(s.e1)) {
+                std::string inv = g_fs.inverseExpression(s.e1);
+                footer = inv.empty() ? " f is one-to-one, so f^-1 is a function (no closed form shown).\n" : " f^-1(x) = " + inv + "\n";
+            } else footer = " [Note] f is not one-to-one, so [o] is only the reflected relation, not a function.\n";
+        } catch (...) {}
+        break; }
+    case GK_SCATTER: {
+        title = s.title;
+        auto xs = s.table.getColumn(s.xc), ys = s.table.getColumn(s.yc);
+        for (size_t i = 0; i < xs.size(); ++i) c.mark(xs[i], ys[i], '*');
+        break; }
+    }
+    return c.render(title) + footer;
+}
+static void ParseRanges(const std::string& out, GView& v) {
+    size_t p = out.rfind("x Range: [");
+    if (p == std::string::npos) return;
+    double a, b, c, d;
+    if (sscanf(out.c_str() + p, "x Range: [%lf to %lf], y Range: [%lf to %lf]", &a, &b, &c, &d) == 4) {
+        v.cx0 = a; v.cx1 = b; v.cy0 = c; v.cy1 = d;
+    }
+}
+static std::string GraphOut(GView& v, const PlotSpec& s) {
+    auto blank = [](const std::string& t) { return Trim(t).empty(); };
+    bool autoX = blank(v.xmin) || blank(v.xmax), autoY = blank(v.ymin) || blank(v.ymax);
+    double x0 = -10, x1 = 10;
+    if (!autoX) {
+        x0 = EvalNum(v.xmin); x1 = EvalNum(v.xmax);
+        if (!(x0 < x1)) throw std::runtime_error("xMin must be less than xMax");
+    } else if (s.kind == GK_SCATTER) {
+        auto xs = s.table.getColumn(s.xc);
+        if (!xs.empty()) { x0 = *std::min_element(xs.begin(), xs.end()); x1 = *std::max_element(xs.begin(), xs.end()); }
+        if (std::fabs(x1 - x0) < 1e-6) { x0 -= 1; x1 += 1; }
+    }
+    int W = blank(v.w) ? std::max(20, g_resCols - 3) : (int)EvalNum(v.w);
+    int H = blank(v.h) ? std::max(8, g_resRows - 6) : (int)EvalNum(v.h);
+    W = std::clamp(W, 20, 300); H = std::clamp(H, 8, 120);
+    std::string out;
+    if (autoY) {
+        MathGraph g(W, H);
+        CoutCapture cap;
+        try {
+            switch (s.kind) {
+                case GK_FUNC:    g.plotFunction(g_calc, s.e1, x0, x1); break;
+                case GK_DERIV:   g.plotDerivative(g_calc, s.e1, s.a, x0, x1); break;
+                case GK_INTEG:   g.plotIntegralArea(g_calc, s.e1, s.a, s.b, x0, x1); break;
+                case GK_LIMIT:   g.plotLimit(g_calc, s.e1, s.a, x0, x1); break;
+                case GK_INDEF:   g.plotIndefiniteIntegral(g_calc, s.e1, s.a, x0, x1); break;
+                case GK_AREA2:   g.plotAreaBetweenCurves(g_calc, s.e1, s.e2, s.a, s.b, x0, x1); break;
+                case GK_INVERSE: g.plotInverseFunction(g_calc, s.e1, x0, x1); break;
+                case GK_SCATTER:
+                    if (autoX) g.plotDataTable(s.table, s.xc, s.yc, s.title);
+                    else g.plotDataTableRange(s.table, s.xc, s.yc, s.title, x0, x1);
+                    break;
+            }
+        } catch (const std::exception& e) { cap.ss << "[Error] " << e.what() << "\n"; }
+        out = cap.ss.str();
+    } else {
+        double y0 = EvalNum(v.ymin), y1 = EvalNum(v.ymax);
+        if (!(y0 < y1)) throw std::runtime_error("yMin must be less than yMax");
+        out = CustomRender(s, W, H, x0, x1, y0, y1);
+    }
+    out = CleanAscii(out);
+    ParseRanges(out, v);
+    return out;
+}
+static PlotSpec Spec(int kind, const std::string& e1, double a = 0, double b = 0, const std::string& e2 = "") {
+    PlotSpec s; s.kind = kind; s.e1 = e1; s.e2 = e2; s.a = a; s.b = b; return s;
+}
 
 // ---------- สร้างแค็ตตาล็อกฟีเจอร์ ----------
 static const char* DIST_NAMES[] = {"Binomial PDF", "Binomial CDF", "Poisson PDF", "Poisson CDF",
@@ -629,14 +822,12 @@ static void BuildCatalog() {
     }
     // ===================== [4] Graph =====================
     {
-        Category c{"2D Text Graph Plotter", "9 plot types, zoom in/out, pan, resolution", {}};
+        Category c{"2D Text Graph Plotter", "9 plot types: zoom, pan left/right/up/down, resolution", {}};
         auto G = [](Feature f) { f.isGraph = true; return f; };
-        c.features.push_back(G(MkF("Plot f(x)", "Plot a function.",
+        c.features.push_back(G(MkF("Plot f(x)", "Plot a function. Use Zoom / Left / Right / Up / Down buttons to move the view.",
             {TF("f(x)", "e.g. sin(x)  or  x^2 - 4")},
-            [](Feature& f) -> std::string {
-                std::string e = Norm(Req(f, 0));
-                return GraphOut([e](MathGraph& g, double a, double b) { g.plotFunction(g_calc, e, a, b); });
-            }, {{"sin(x)"}, {"x^2-4"}, {"x^3-3x"}})));
+            [](Feature& f) -> std::string { return GraphOut(g_gv, Spec(GK_FUNC, Norm(Req(f, 0)))); },
+            {{"sin(x)"}, {"x^2-4"}, {"x^3-3x"}})));
         c.features.push_back(G(MkF("Plot Polynomial with Roots", "Coefficients from the highest power down. Roots are listed below the graph.",
             {TF("Coefficients", "1 -3 2")},
             [](Feature& f) -> std::string {
@@ -649,7 +840,7 @@ static void BuildCatalog() {
                     char buf[64]; snprintf(buf, sizeof buf, "%.12g", use[i]);
                     e += (i ? "+" : "") + std::string("(") + buf + ")" + (p > 0 ? "*x^" + std::to_string(p) : "");
                 }
-                std::string out = GraphOut([e](MathGraph& g, double a, double b) { g.plotFunction(g_calc, e, a, b); });
+                std::string out = GraphOut(g_gv, Spec(GK_FUNC, e));
                 auto roots = g_calc.solver().solvePolynomial(use);
                 out += "\nRoots:";
                 for (auto& z : roots) out += "   " + FmtComplex(z);
@@ -657,41 +848,29 @@ static void BuildCatalog() {
             }, {{"1 -3 2"}, {"1 0 -4"}, {"1 0 1"}})));
         c.features.push_back(G(MkF("Plot Derivative & Tangent at x0", "Graph of f with its tangent line at x0.",
             {TF("f(x)", "e.g. x^2"), TF("x0", "e.g. 1")},
-            [](Feature& f) -> std::string {
-                std::string e = Norm(Req(f, 0)); double x0 = Num(f, 1);
-                return GraphOut([e, x0](MathGraph& g, double a, double b) { g.plotDerivative(g_calc, e, x0, a, b); });
-            }, {{"x^2", "1"}})));
+            [](Feature& f) -> std::string { return GraphOut(g_gv, Spec(GK_DERIV, Norm(Req(f, 0)), Num(f, 1))); },
+            {{"x^2", "1"}})));
         c.features.push_back(G(MkF("Plot Integral Area over [a, b]", "Shaded area under f.",
             {TF("f(x)", "e.g. x^2"), TF("a", "e.g. 0"), TF("b", "e.g. 2")},
-            [](Feature& f) -> std::string {
-                std::string e = Norm(Req(f, 0)); double lo = Num(f, 1), hi = Num(f, 2);
-                return GraphOut([e, lo, hi](MathGraph& g, double a, double b) { g.plotIntegralArea(g_calc, e, lo, hi, a, b); });
-            }, {{"x^2", "0", "2"}})));
+            [](Feature& f) -> std::string { return GraphOut(g_gv, Spec(GK_INTEG, Norm(Req(f, 0)), Num(f, 1), Num(f, 2))); },
+            {{"x^2", "0", "2"}})));
         c.features.push_back(G(MkF("Plot Limit  x -> a", "Show f approaching a.",
             {TF("f(x)", "e.g. sin(x)/x"), TF("a", "e.g. 0")},
-            [](Feature& f) -> std::string {
-                std::string e = Norm(Req(f, 0)); double t = Num(f, 1);
-                return GraphOut([e, t](MathGraph& g, double a, double b) { g.plotLimit(g_calc, e, t, a, b); });
-            }, {{"sin(x)/x", "0"}})));
+            [](Feature& f) -> std::string { return GraphOut(g_gv, Spec(GK_LIMIT, Norm(Req(f, 0)), Num(f, 1))); },
+            {{"sin(x)/x", "0"}})));
         c.features.push_back(G(MkF("Plot Indefinite Integral F(x)", "Graph of F(x) = integral of f from x_ref.",
             {TF("f(x)", "e.g. cos(x)"), TF("x_ref (default 0)", "0", "0")},
-            [](Feature& f) -> std::string {
-                std::string e = Norm(Req(f, 0)); double xr = NumOr(f, 1, 0.0);
-                return GraphOut([e, xr](MathGraph& g, double a, double b) { g.plotIndefiniteIntegral(g_calc, e, xr, a, b); });
-            }, {{"cos(x)", "0"}})));
+            [](Feature& f) -> std::string { return GraphOut(g_gv, Spec(GK_INDEF, Norm(Req(f, 0)), NumOr(f, 1, 0.0))); },
+            {{"cos(x)", "0"}})));
         c.features.push_back(MkLab("Plot Scatter Plot from DataTable", "Enter a data table and plot two columns.", FK_TABLE, 6));
         c.features.push_back(G(MkF("Plot Area Between Two Curves", "Shaded area between f1 and f2 on [a, b].",
             {TF("f1(x)", "e.g. x"), TF("f2(x)", "e.g. x^2"), TF("a", "e.g. 0"), TF("b", "e.g. 1")},
-            [](Feature& f) -> std::string {
-                std::string e1 = Norm(Req(f, 0)), e2 = Norm(Req(f, 1)); double lo = Num(f, 2), hi = Num(f, 3);
-                return GraphOut([e1, e2, lo, hi](MathGraph& g, double a, double b) { g.plotAreaBetweenCurves(g_calc, e1, e2, lo, hi, a, b); });
-            }, {{"x", "x^2", "0", "1"}})));
+            [](Feature& f) -> std::string { return GraphOut(g_gv, Spec(GK_AREA2, Norm(Req(f, 0)), Num(f, 2), Num(f, 3), Norm(Req(f, 1)))); },
+            {{"x", "x^2", "0", "1"}})));
         c.features.push_back(G(MkF("Plot Inverse Function f^-1(x)", "f, its inverse (reflection) and y = x.",
             {TF("f(x)", "e.g. 2x + 1  or  x^3")},
-            [](Feature& f) -> std::string {
-                std::string e = Norm(Req(f, 0));
-                return GraphOut([e](MathGraph& g, double a, double b) { g.plotInverseFunction(g_calc, e, a, b); });
-            }, {{"2x+1"}, {"x^3"}})));
+            [](Feature& f) -> std::string { return GraphOut(g_gv, Spec(GK_INVERSE, Norm(Req(f, 0)))); },
+            {{"2x+1"}, {"x^3"}})));
         g_cats.push_back(c);
     }
     // ===================== [5] Matrix =====================
@@ -1227,6 +1406,47 @@ static void ApplyExample(Feature& f) {
     f.error.clear();
     ResetFocus();
 }
+// แถบควบคุมกราฟ: Plot / Zoom / เลื่อนซ้าย-ขวา-ขึ้น-ลง / Reset + ช่องกำหนดช่วง x, y และความละเอียด
+static int GraphControls(int x, int y, int w, GView& v, const std::function<void()>& rerun, bool& plotClicked) {
+    int y0 = y;
+    const char* names[8] = {"Plot", "Zoom +", "Zoom -", "< Left", "Right >", "Up", "Down", "Reset"};
+    int bw = (w - 7 * 4) / 8;
+    auto setX = [&](double a, double b) { v.xmin = Fmt(a); v.xmax = Fmt(b); };
+    auto setY = [&](double a, double b) { v.ymin = Fmt(a); v.ymax = Fmt(b); };
+    bool manualY = !Trim(v.ymin).empty() && !Trim(v.ymax).empty();
+    for (int i = 0; i < 8; ++i) {
+        uint32_t col = i == 0 ? COL_OK : i == 7 ? COL_CLEAR : COL_BTN;
+        if (!DrawButton(x + i * (bw + 4), y, bw, 30, names[i], col, g_fontM)) continue;
+        double cx = (v.cx0 + v.cx1) / 2, hx = v.cx1 - v.cx0, cy = (v.cy0 + v.cy1) / 2, hy = v.cy1 - v.cy0;
+        switch (i) {
+            case 0: plotClicked = true; break;
+            case 1: setX(cx - hx / 4, cx + hx / 4); if (manualY) setY(cy - hy / 4, cy + hy / 4); rerun(); break;
+            case 2: setX(cx - hx, cx + hx);         if (manualY) setY(cy - hy, cy + hy);         rerun(); break;
+            case 3: setX(v.cx0 - hx / 4, v.cx1 - hx / 4); rerun(); break;
+            case 4: setX(v.cx0 + hx / 4, v.cx1 + hx / 4); rerun(); break;
+            case 5: setY(v.cy0 + hy / 4, v.cy1 + hy / 4); rerun(); break;      // เลื่อนมุมมองขึ้น
+            case 6: setY(v.cy0 - hy / 4, v.cy1 - hy / 4); rerun(); break;      // เลื่อนมุมมองลง
+            case 7: v.xmin = v.defX0; v.xmax = v.defX1; v.ymin.clear(); v.ymax.clear(); v.w.clear(); v.h.clear(); rerun(); break;
+        }
+    }
+    y += 34;
+    int gw = (w - 3 * 6) / 4;
+    const char* lab[4] = {"xMin", "xMax", "yMin", "yMax"};
+    std::string* ss[4] = {&v.xmin, &v.xmax, &v.ymin, &v.ymax};
+    for (int i = 0; i < 4; ++i) {
+        int bx = x + i * (gw + 6);
+        DrawText_(bx, y + 7, lab[i], COL_DIM, g_fontM);
+        TextBox(bx + 36, y, gw - 36, 28, *ss[i], "auto", g_fontM);
+    }
+    y += 34;
+    DrawText_(x, y + 7, "Width", COL_DIM, g_fontM);  TextBox(x + 42, y, 56, 28, v.w, "auto", g_fontM);
+    DrawText_(x + 108, y + 7, "Height", COL_DIM, g_fontM); TextBox(x + 156, y, 56, 28, v.h, "auto", g_fontM);
+    if (DrawButton(x + 224, y, 90, 28, "Auto Y", COL_CHIP, g_fontM)) { v.ymin.clear(); v.ymax.clear(); rerun(); }
+    DrawText_(x + 324, y + 7, "(blank y = auto scale)", COL_DIM, g_fontM);
+    y += 36;
+    return y - y0;
+}
+
 static void ScreenForm() {
     Feature& f = CurFeature();
     if (f.refresh) f.refresh(f);
@@ -1283,32 +1503,10 @@ static void ScreenForm() {
     // ---- แผงขวา ----
     int rx = lx + lw + 12, rw = g_w - rx - 10, ry = 56;
     if (f.isGraph) {
-        int bw = (rw - 5 * 4) / 6;
+        bool plotClicked = false;
         auto rerun = [&f]() { if (!f.result.empty() || !f.error.empty()) Defer([&f] { RunFeature(f); }); };
-        if (DrawButton(rx, ry, bw, 30, "Plot", COL_OK)) doRun = true;
-        if (DrawButton(rx + (bw + 4) * 1, ry, bw, 30, "Zoom +", COL_BTN)) {
-            try { double a = EvalNum(g_gxMinS), b = EvalNum(g_gxMaxS), c = (a + b) / 2, h = (b - a) / 4; GraphSetRange(c - h, c + h); rerun(); } catch (...) {}
-        }
-        if (DrawButton(rx + (bw + 4) * 2, ry, bw, 30, "Zoom -", COL_BTN)) {
-            try { double a = EvalNum(g_gxMinS), b = EvalNum(g_gxMaxS), c = (a + b) / 2, h = (b - a); GraphSetRange(c - h, c + h); rerun(); } catch (...) {}
-        }
-        if (DrawButton(rx + (bw + 4) * 3, ry, bw, 30, "<  Left", COL_BTN)) {
-            try { double a = EvalNum(g_gxMinS), b = EvalNum(g_gxMaxS), d = (b - a) / 4; GraphSetRange(a - d, b - d); rerun(); } catch (...) {}
-        }
-        if (DrawButton(rx + (bw + 4) * 4, ry, bw, 30, "Right  >", COL_BTN)) {
-            try { double a = EvalNum(g_gxMinS), b = EvalNum(g_gxMaxS), d = (b - a) / 4; GraphSetRange(a + d, b + d); rerun(); } catch (...) {}
-        }
-        if (DrawButton(rx + (bw + 4) * 5, ry, bw, 30, "Reset", COL_CLEAR)) {
-            g_gxMinS = "-10"; g_gxMaxS = "10"; g_gwS.clear(); g_ghS.clear(); rerun();
-        }
-        ry += 38;
-        int tw = (rw - 4 * 70) / 4 - 4;
-        int tx = rx;
-        DrawText_(tx, ry + 7, "xMin", COL_DIM, g_fontM); TextBox(tx + 36, ry, tw - 20, 28, g_gxMinS, "-10", g_fontM); tx += tw + 18;
-        DrawText_(tx, ry + 7, "xMax", COL_DIM, g_fontM); TextBox(tx + 36, ry, tw - 20, 28, g_gxMaxS, "10", g_fontM); tx += tw + 18;
-        DrawText_(tx, ry + 7, "Width", COL_DIM, g_fontM); TextBox(tx + 40, ry, tw - 24, 28, g_gwS, "auto", g_fontM); tx += tw + 18;
-        DrawText_(tx, ry + 7, "Height", COL_DIM, g_fontM); TextBox(tx + 44, ry, tw - 28, 28, g_ghS, "auto", g_fontM);
-        ry += 36;
+        ry += GraphControls(rx, ry, rw, g_gv, rerun, plotClicked);
+        if (plotClicked) doRun = true;
     }
     ResultPanel(rx, ry, rw, g_h - ry - 10, f.result, f.error, f.scroll, !f.isGraph);
     if (doRun) Defer([&f] { RunFeature(f); });
@@ -1611,9 +1809,15 @@ static std::string TableRun() {
         default: {
             int xc = (int)EvalNum(g_tp[0].empty() ? "1" : g_tp[0]) - 1, yc = (int)EvalNum(g_tp[1].empty() ? "2" : g_tp[1]) - 1;
             if (xc < 0 || yc < 0 || xc >= t.getCols() || yc >= t.getCols()) throw std::runtime_error("Column number out of range");
-            return GraphOut([t, xc, yc](MathGraph& g, double, double) { g.plotDataTable(t, xc, yc, "Scatter Plot"); });
+            PlotSpec sp; sp.kind = GK_SCATTER; sp.table = t; sp.xc = xc; sp.yc = yc; sp.title = "Scatter Plot";
+            return GraphOut(g_gvScatter, sp);
         }
     }
+}
+static void TableExec() {
+    g_terr.clear();
+    try { g_tres = TableRun(); } catch (const std::exception& e) { g_terr = e.what(); g_tres.clear(); }
+    g_tscroll = 0;
 }
 static void ScreenTable() {
     TableInit();
@@ -1661,11 +1865,13 @@ static void ScreenTable() {
         if (DrawButton(std::max(px + 10, w - 170), y - 2, 160, 34, "Calculate", COL_OK)) run = true;
         y += 42;
     }
-    if (run) Defer([] {
-        g_terr.clear();
-        try { g_tres = TableRun(); } catch (const std::exception& e) { g_terr = e.what(); g_tres.clear(); }
-        g_tscroll = 0;
-    });
+    if (g_top == 6) {      // กราฟ scatter: แถบควบคุมซูม/เลื่อนซ้าย-ขวา-ขึ้น-ลง
+        bool pc = false;
+        auto rr = []() { if (!g_tres.empty() || !g_terr.empty()) Defer(TableExec); };
+        y += GraphControls(x, y, w, g_gvScatter, rr, pc);
+        if (pc) run = true;
+    }
+    if (run) Defer(TableExec);
     std::string err = g_terr;
     ResultPanel(x, y, w, g_h - y - 10, g_tres, err, g_tscroll, false);
 }
