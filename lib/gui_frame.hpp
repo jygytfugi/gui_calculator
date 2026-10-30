@@ -1,3 +1,4 @@
+//          g++ -std=c++17 *.cpp -o calc -lX11
 #include "lib/algebra.hpp"
 #include "lib/Alpha_solver_eq.hpp"
 #include "lib/Calculator_calculus.hpp"
@@ -10,6 +11,7 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
+#include <X11/Xatom.h>
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -167,7 +169,7 @@ static bool TextBox(int x, int y, int w, int h, std::string& s, const std::strin
 }
 
 // ---------- เหตุการณ์ที่รอประมวลผลใน Frame ----------
-static int  g_wheel = 0, g_wheelKey = 0;
+static int  g_wheel = 0, g_wheelKey = 0, g_wheelH = 0, g_hKey = 0;
 static bool g_enter = false, g_escape = false;
 static char g_pendingChar = 0;
 static std::vector<std::function<void()>> g_deferred;
@@ -255,6 +257,17 @@ static std::vector<std::string> SplitTop(const std::string& s, const std::string
     return out;
 }
 static double EvalNum(const std::string& s) { return g_calc.evaluate(ReplaceAns(s)); }
+// ค่าในเซลล์: ถ้าเป็นตัวเลขล้วนอ่านตรง ๆ (เร็ว สำหรับตารางใหญ่) ไม่งั้นประเมินเป็นสูตร
+static double CellValue(const std::string& raw) {
+    const char* s = raw.c_str();
+    while (isspace((unsigned char)*s)) ++s;
+    if (!*s) return 0.0;
+    char* end = nullptr;
+    double v = strtod(s, &end);
+    while (*end && isspace((unsigned char)*end)) ++end;
+    if (!*end) return v;
+    return EvalNum(raw);
+}
 static std::vector<double> ParseList(const std::string& s, const char* what = "numbers") {
     std::vector<double> v;
     for (auto& t : SplitTop(s, ", ;\t")) v.push_back(EvalNum(t));
@@ -307,15 +320,19 @@ static std::string CleanAscii(const std::string& s) {      // ตัดรหั
     }
     return out;
 }
-static std::string FormatTable(const DataTable& t) {
+static std::string FormatTable(const DataTable& t, int maxRows = 3000, int maxCols = 200) {
     std::string out;
     char buf[96];
-    for (int c = 0; c < t.getCols(); ++c) { snprintf(buf, sizeof buf, "%-14s", t.getHeader(c).c_str()); out += buf; }
+    int cc = std::min(t.getCols(), maxCols), rr = std::min(t.getRows(), maxRows);
+    for (int c = 0; c < cc; ++c) { snprintf(buf, sizeof buf, "%-14s", t.getHeader(c).c_str()); out += buf; }
     out += "\n";
-    for (int r = 0; r < t.getRows(); ++r) {
-        for (int c = 0; c < t.getCols(); ++c) { snprintf(buf, sizeof buf, "%-14.8g", t.getCell(r, c)); out += buf; }
+    for (int r = 0; r < rr; ++r) {
+        for (int c = 0; c < cc; ++c) { snprintf(buf, sizeof buf, "%-14.8g", t.getCell(r, c)); out += buf; }
         out += "\n";
     }
+    if (rr < t.getRows() || cc < t.getCols())
+        out += "... showing " + std::to_string(rr) + " of " + std::to_string(t.getRows()) + " rows, " +
+               std::to_string(cc) + " of " + std::to_string(t.getCols()) + " columns\n";
     return out;
 }
 static std::string FormatMatrix(const Matrix& m) {
@@ -355,7 +372,7 @@ static std::vector<std::string> BuildLines(const std::string& text, int perLine,
 // ---------- แผงแสดงผลลัพธ์ (เลื่อนได้) ----------
 static int g_resCols = 80, g_resRows = 24;      // ขนาดล่าสุดของแผงผลลัพธ์ (ใช้กำหนดความละเอียดกราฟอัตโนมัติ)
 static void ResultPanel(int x, int y, int w, int h, const std::string& text, const std::string& err,
-                        int& scroll, bool wrap = true) {
+                        int& scroll, bool wrap = true, int* hscroll = nullptr) {
     FillRectPx(x, y, w, h, COL_PANEL);
     Border(x, y, w, h, COL_BORDER);
     int fh = FontH(g_fontM) + 2, cw = CharW(g_fontM);
@@ -367,13 +384,24 @@ static void ResultPanel(int x, int y, int w, int h, const std::string& text, con
         DrawText_(x + 10, y + 8, "Result appears here.", COL_DIM, g_fontM);
         return;
     }
-    auto lines = BuildLines(show, cols, isErr ? true : wrap);
+    bool hs = hscroll && !wrap && !isErr;
+    auto lines = BuildLines(show, hs ? 1000000 : cols, isErr ? true : wrap);
     int maxScroll = std::max(0, (int)lines.size() - rows);
+    int maxLen = 0;
+    if (hs) for (auto& l : lines) maxLen = std::max(maxLen, (int)l.size());
+    int hmax = hs ? std::max(0, maxLen - cols) : 0;
     if (Hit(x, y, w, h) && g_wheel) { scroll += g_wheel * 3; g_wheel = 0; }
+    if (Hit(x, y, w, h) && g_wheelH && hs) { *hscroll += g_wheelH * 8; g_wheelH = 0; }
     if (g_wheelKey) { scroll += g_wheelKey; g_wheelKey = 0; }
+    if (g_hKey && hs) { *hscroll += g_hKey * 8; g_hKey = 0; }
     scroll = std::clamp(scroll, 0, maxScroll);
-    for (int i = 0; i < rows && i + scroll < (int)lines.size(); ++i)
-        DrawText_(x + 8, y + 4 + i * fh, lines[i + scroll], isErr ? COL_RED : COL_GREEN, g_fontM);
+    int hoff = 0;
+    if (hs) { *hscroll = std::clamp(*hscroll, 0, hmax); hoff = *hscroll; }
+    for (int i = 0; i < rows && i + scroll < (int)lines.size(); ++i) {
+        const std::string& ln = lines[i + scroll];
+        DrawText_(x + 8, y + 4 + i * fh, hs ? (hoff < (int)ln.size() ? ln.substr(hoff, cols) : std::string()) : ln,
+                  isErr ? COL_RED : COL_GREEN, g_fontM);
+    }
     if (maxScroll > 0) {
         if (DrawButton(x + w - 20, y + 2, 18, 18, "^", COL_CHIP, g_fontM)) scroll = std::max(0, scroll - 3);
         if (DrawButton(x + w - 20, y + h - 20, 18, 18, "v", COL_CHIP, g_fontM)) scroll = std::min(maxScroll, scroll + 3);
@@ -382,6 +410,11 @@ static void ResultPanel(int x, int y, int w, int h, const std::string& text, con
         int thumbH = std::max(14, trackH * rows / (int)lines.size());
         int thumbY = trackY + (trackH - thumbH) * scroll / maxScroll;
         FillRectPx(x + w - 14, thumbY, 6, thumbH, RGB32(110, 120, 140));
+    }
+    if (hmax > 0) {
+        if (DrawButton(x + w - 64, y + h - 20, 18, 18, "<", COL_CHIP, g_fontM)) *hscroll = std::max(0, *hscroll - 16);
+        if (DrawButton(x + w - 43, y + h - 20, 18, 18, ">", COL_CHIP, g_fontM)) *hscroll = std::min(hmax, *hscroll + 16);
+        DrawText_(x + w - 240, y + h - 18, "cols " + std::to_string(hoff + 1) + "-" + std::to_string(std::min(maxLen, hoff + cols)) + " of " + std::to_string(maxLen) + "  (<- ->)", COL_DIM, g_fontM);
     }
 }
 
@@ -457,6 +490,9 @@ struct PlotSpec {
     double a = 0, b = 0;
     DataTable table;
     int xc = 0, yc = 1;
+    std::vector<int> ycs;                // หลายซีรีส์ (คอลัมน์ y หลายตัว) ถ้าไม่ว่างจะใช้แทน yc
+    std::vector<std::string> names;      // ชื่อซีรีส์สำหรับคำอธิบาย
+    bool lines = false;                  // ลากเส้นเชื่อมจุด
 };
 struct GView {
     std::string xmin, xmax, ymin, ymax, w, h;       // ช่องว่าง = อัตโนมัติ
@@ -472,6 +508,8 @@ struct Canvas {
     std::vector<std::string> g;
     Canvas(int w, int h, double xa, double xb, double ya, double yb)
         : W(w), H(h), x0(xa), x1(xb), y0(ya), y1(yb), g(h, std::string(w, ' ')) {}
+    double fc(double x) const { return (x - x0) / (x1 - x0) * (W - 1); }
+    double fr(double y) const { return (H - 1) - (y - y0) / (y1 - y0) * (H - 1); }
     int col(double x) const { return (int)std::clamp((x - x0) / (x1 - x0) * (W - 1), -1e6, 1e6); }
     int row(double y) const { return H - 1 - (int)std::clamp((y - y0) / (y1 - y0) * (H - 1), -1e6, 1e6); }
     bool inX(double x) const { return x >= x0 && x <= x1; }
@@ -598,8 +636,29 @@ static std::string CustomRender(const PlotSpec& s, int W, int H, double x0, doub
         break; }
     case GK_SCATTER: {
         title = s.title;
-        auto xs = s.table.getColumn(s.xc), ys = s.table.getColumn(s.yc);
-        for (size_t i = 0; i < xs.size(); ++i) c.mark(xs[i], ys[i], '*');
+        auto xs = s.table.getColumn(s.xc);
+        std::vector<int> cols = s.ycs.empty() ? std::vector<int>{s.yc} : s.ycs;
+        static const char sym[] = "*o+x#@%&";
+        footer = " Series:";
+        for (size_t k = 0; k < cols.size(); ++k) {
+            char ch = sym[k % 8];
+            auto ys = s.table.getColumn(cols[k]);
+            if (s.lines) {                                    // เชื่อมจุดตามลำดับ x
+                std::vector<size_t> idx(xs.size());
+                for (size_t i = 0; i < idx.size(); ++i) idx[i] = i;
+                std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) { return xs[a] < xs[b]; });
+                for (size_t i = 0; i + 1 < idx.size(); ++i) {
+                    double xa = xs[idx[i]], ya = ys[idx[i]], xb = xs[idx[i + 1]], yb = ys[idx[i + 1]];
+                    if ((xa < x0 && xb < x0) || (xa > x1 && xb > x1)) continue;
+                    double dc = std::fabs(c.fc(xb) - c.fc(xa)), dr = std::fabs(c.fr(yb) - c.fr(ya));
+                    int steps = (int)std::clamp(std::max(dc, dr), 1.0, 4000.0);
+                    for (int t = 1; t < steps; ++t) { double u = (double)t / steps; c.markBlank(xa + (xb - xa) * u, ya + (yb - ya) * u, '.'); }
+                }
+            }
+            for (size_t i = 0; i < xs.size(); ++i) c.mark(xs[i], ys[i], ch);
+            footer += std::string("  [") + ch + "] " + (k < s.names.size() ? s.names[k] : "y" + std::to_string(cols[k] + 1));
+        }
+        footer += "\n";
         break; }
     }
     return c.render(title) + footer;
@@ -628,7 +687,8 @@ static std::string GraphOut(GView& v, const PlotSpec& s) {
     int H = blank(v.h) ? std::max(8, g_resRows - 6) : (int)EvalNum(v.h);
     W = std::clamp(W, 20, 300); H = std::clamp(H, 8, 120);
     std::string out;
-    if (autoY) {
+    bool multi = s.kind == GK_SCATTER && (s.ycs.size() > 1 || s.lines);
+    if (autoY && !multi) {
         MathGraph g(W, H);
         CoutCapture cap;
         try {
@@ -648,8 +708,23 @@ static std::string GraphOut(GView& v, const PlotSpec& s) {
         } catch (const std::exception& e) { cap.ss << "[Error] " << e.what() << "\n"; }
         out = cap.ss.str();
     } else {
-        double y0 = EvalNum(v.ymin), y1 = EvalNum(v.ymax);
-        if (!(y0 < y1)) throw std::runtime_error("yMin must be less than yMax");
+        double y0, y1;
+        if (autoY) {                                           // สเกล y อัตโนมัติจากข้อมูลทุกซีรีส์ในช่วง x ที่เห็น
+            std::vector<int> cols = s.ycs.empty() ? std::vector<int>{s.yc} : s.ycs;
+            auto xs = s.table.getColumn(s.xc);
+            bool any = false; y0 = 1e300; y1 = -1e300;
+            for (int cidx : cols) {
+                auto ys = s.table.getColumn(cidx);
+                for (size_t i = 0; i < xs.size(); ++i)
+                    if (xs[i] >= x0 && xs[i] <= x1 && std::isfinite(ys[i])) { y0 = std::min(y0, ys[i]); y1 = std::max(y1, ys[i]); any = true; }
+            }
+            if (!any) throw std::runtime_error("No data points inside the x range");
+            if (std::fabs(y1 - y0) < 1e-6) { y0 -= 1; y1 += 1; }
+            double pad = (y1 - y0) * 0.05; y0 -= pad; y1 += pad;
+        } else {
+            y0 = EvalNum(v.ymin); y1 = EvalNum(v.ymax);
+            if (!(y0 < y1)) throw std::runtime_error("yMin must be less than yMax");
+        }
         out = CustomRender(s, W, H, x0, x1, y0, y1);
     }
     out = CleanAscii(out);
@@ -1515,7 +1590,7 @@ static void ScreenForm() {
 //                    ตัวแก้ไขตาราง (Grid) ใช้ร่วมกัน Matrix / DataTable
 // ============================================================
 struct Grid {
-    int r = 2, c = 2, scroll = 0;
+    int r = 2, c = 2, scroll = 0, scrollC = 0;
     std::vector<std::string> cell, hdr;
 };
 static Grid MakeGrid(int r, int c) {
@@ -1530,42 +1605,86 @@ static void ResizeGrid(Grid& g, int nr, int nc) {
     g.hdr.resize(nc);
     for (int j = g.c; j < nc; ++j) g.hdr[j] = "col" + std::to_string(j + 1);
     g.cell.swap(n); g.r = nr; g.c = nc;
+    g.scroll = std::clamp(g.scroll, 0, std::max(0, nr - 1)); g.scrollC = std::clamp(g.scrollC, 0, std::max(0, nc - 1));
     ResetFocus();
 }
-static void FillGridFromText(Grid& g, const std::string& text, int maxR, int maxC) {   // แถวคั่น ; หรือขึ้นบรรทัด, คอลัมน์คั่น , หรือ space
+static bool LooksNumeric(const std::string& s) {
+    const char* p = s.c_str(); char* end = nullptr;
+    if (!*p) return false;
+    strtod(p, &end);
+    return end != p && *end == 0;
+}
+// แถวคั่นด้วย ; (หรือขึ้นบรรทัด) คอลัมน์คั่นด้วย , หรือ space/tab
+// append = ต่อท้ายแถวใหม่   headerDetect = ถ้าแถวแรกเป็นข้อความทั้งหมดให้ใช้เป็นชื่อคอลัมน์
+static void FillGridFromText(Grid& g, const std::string& text, int maxR, int maxC, bool append = false, bool headerDetect = false) {
     std::string t = text;
-    for (char& ch : t) if (ch == '\n') ch = ';';
+    for (char& ch : t) if (ch == '\n' || ch == '\r') ch = ';';
     std::vector<std::vector<std::string>> rows;
     for (auto& r : SplitTop(t, ";")) rows.push_back(SplitTop(r, ", \t"));
-    if (rows.empty()) throw std::runtime_error("Type values like  1,2;3,4  (rows separated by ;)");
+    if (rows.empty()) throw std::runtime_error("Type or paste values like  1,2;3,4  (rows separated by ; or new lines)");
+    std::vector<std::string> hdr;
+    if (headerDetect && rows.size() > 1) {
+        bool allText = true;
+        for (auto& tok : rows[0]) if (LooksNumeric(tok) || !isalpha((unsigned char)tok[0])) allText = false;
+        if (allText) { hdr = rows[0]; rows.erase(rows.begin()); }
+    }
     size_t cols = 0; for (auto& r : rows) cols = std::max(cols, r.size());
-    if ((int)rows.size() > maxR || (int)cols > maxC) throw std::runtime_error("Too large (max " + std::to_string(maxR) + " x " + std::to_string(maxC) + ")");
-    for (auto& r : rows) if (r.size() != cols) throw std::runtime_error("Every row must have the same number of values");
-    Grid n = MakeGrid((int)rows.size(), (int)cols);
-    for (size_t i = 0; i < rows.size(); ++i) for (size_t j = 0; j < cols; ++j) n.cell[i * cols + j] = rows[i][j];
+    if (append) cols = std::max(cols, (size_t)g.c);
+    size_t totalRows = rows.size() + (append ? (size_t)g.r : 0);
+    if ((long long)totalRows > maxR || (long long)cols > maxC) throw std::runtime_error("Too large (max " + std::to_string(maxR) + " x " + std::to_string(maxC) + ")");
+    for (auto& r : rows) if (r.size() != cols && !(append && r.size() <= cols && r.size() > 0)) {
+        if (r.size() != cols) throw std::runtime_error("Every row must have the same number of values");
+    }
+    Grid n = MakeGrid((int)totalRows, (int)cols);
+    size_t off = 0;
+    if (append) {
+        for (int i = 0; i < g.r; ++i) for (int j = 0; j < g.c; ++j) n.cell[(size_t)i * cols + j] = g.cell[(size_t)i * g.c + j];
+        off = g.r;
+    }
+    for (size_t i = 0; i < rows.size(); ++i) for (size_t j = 0; j < rows[i].size() && j < cols; ++j) n.cell[(off + i) * cols + j] = rows[i][j];
     n.hdr = g.hdr; n.hdr.resize(cols);
     for (size_t j = g.hdr.size(); j < cols; ++j) n.hdr[j] = "col" + std::to_string(j + 1);
+    if (!hdr.empty()) for (size_t j = 0; j < hdr.size() && j < cols; ++j) n.hdr[j] = hdr[j];
     g = n;
     ResetFocus();
 }
-static int DrawGrid(int x, int y, int maxW, int maxRows, Grid& g, bool editHeaders) {
-    int rowLab = 30, ch = 26;
-    int cw = std::clamp((maxW - rowLab) / std::max(1, g.c), 50, 130);
+// วาดตาราง: fixedCw > 0 = โหมดตารางใหญ่ (เลื่อนแถว/คอลัมน์ได้ไม่จำกัด)
+static int DrawGrid(int x, int y, int maxW, int maxRows, Grid& g, bool editHeaders, int fixedCw = 0) {
+    int rowLab = fixedCw ? 46 : 30, ch = 26;
+    int cw, visC;
+    if (fixedCw) { cw = fixedCw; visC = std::clamp((maxW - rowLab - 110) / cw, 1, g.c); }
+    else { cw = std::clamp((maxW - rowLab) / std::max(1, g.c), 50, 130); visC = g.c; }
+    int vis = std::min(g.r, maxRows), maxScroll = std::max(0, g.r - vis), maxScrollC = std::max(0, g.c - visC);
+    bool over = Hit(x, y, maxW, (vis + (editHeaders ? 1 : 0)) * ch);
+    if (over && g_wheel) { g.scroll += g_wheel * (fixedCw ? 3 : 1); g_wheel = 0; }
+    if (over && g_wheelH) { g.scrollC += g_wheelH * 2; g_wheelH = 0; }
+    g.scroll = std::clamp(g.scroll, 0, maxScroll);
+    g.scrollC = std::clamp(g.scrollC, 0, maxScrollC);
     int yy = y;
     if (editHeaders) {
-        for (int j = 0; j < g.c; ++j) TextBox(x + rowLab + j * cw, yy, cw - 2, ch - 2, g.hdr[j], "name", g_fontM);
+        for (int j = 0; j < visC; ++j) TextBox(x + rowLab + j * cw, yy, cw - 2, ch - 2, g.hdr[g.scrollC + j], "name", g_fontM);
         yy += ch;
     }
-    int vis = std::min(g.r, maxRows), maxScroll = std::max(0, g.r - vis);
-    if (Hit(x, y, maxW, (vis + 1) * ch) && g_wheel) { g.scroll += g_wheel; g_wheel = 0; }
-    g.scroll = std::clamp(g.scroll, 0, maxScroll);
     for (int i = 0; i < vis; ++i) {
         int r = g.scroll + i;
         DrawText_(x + 4, yy + (ch - FontH(g_fontM)) / 2, std::to_string(r + 1), COL_DIM, g_fontM);
-        for (int j = 0; j < g.c; ++j) TextBox(x + rowLab + j * cw, yy, cw - 2, ch - 2, g.cell[(size_t)r * g.c + j], "0", g_fontM);
+        for (int j = 0; j < visC; ++j)
+            TextBox(x + rowLab + j * cw, yy, cw - 2, ch - 2, g.cell[(size_t)r * g.c + g.scrollC + j], "0", g_fontM);
         yy += ch;
     }
-    if (maxScroll > 0) DrawText_(x + rowLab + g.c * cw + 4, y, "rows " + std::to_string(g.scroll + 1) + "-" + std::to_string(g.scroll + vis) + " of " + std::to_string(g.r) + " (wheel)", COL_DIM, g_fontM);
+    if (fixedCw) {
+        int cx = x + rowLab + visC * cw + 8;
+        DrawText_(cx, y, "r " + std::to_string(g.scroll + 1) + "-" + std::to_string(g.scroll + vis) + "/" + std::to_string(g.r), COL_DIM, g_fontM);
+        DrawText_(cx, y + 16, "c " + std::to_string(g.scrollC + 1) + "-" + std::to_string(g.scrollC + visC) + "/" + std::to_string(g.c), COL_DIM, g_fontM);
+        int by = y + 36;
+        if (DrawButton(cx, by, 28, 24, "^", COL_CHIP, g_fontM)) g.scroll = std::max(0, g.scroll - std::max(1, vis - 1));
+        if (DrawButton(cx + 32, by, 28, 24, "v", COL_CHIP, g_fontM)) g.scroll = std::min(maxScroll, g.scroll + std::max(1, vis - 1));
+        if (DrawButton(cx, by + 28, 28, 24, "<", COL_CHIP, g_fontM)) g.scrollC = std::max(0, g.scrollC - std::max(1, visC - 1));
+        if (DrawButton(cx + 32, by + 28, 28, 24, ">", COL_CHIP, g_fontM)) g.scrollC = std::min(maxScrollC, g.scrollC + std::max(1, visC - 1));
+        DrawText_(cx, by + 58, "wheel / Shift+wheel", COL_DIM, g_fontM);
+    } else if (maxScroll > 0) {
+        DrawText_(x + rowLab + g.c * cw + 4, y, "rows " + std::to_string(g.scroll + 1) + "-" + std::to_string(g.scroll + vis) + " of " + std::to_string(g.r) + " (wheel)", COL_DIM, g_fontM);
+    }
     return yy - y;
 }
 static bool Stepper(int x, int y, const std::string& label, int& value, int lo, int hi) {
@@ -1585,7 +1704,7 @@ static std::vector<Grid> g_mats;
 static std::vector<char> g_muse;
 static int g_msel = 0;
 static std::string g_mp[2], g_mquick, g_mres, g_merr;
-static int g_mscroll = 0;
+static int g_mscroll = 0, g_mhscroll = 0;
 static Matrix g_lastMat(1, 1);
 static bool g_haveLast = false;
 static const int MAT_MAX = 12, MAT_COUNT_MAX = 8;
@@ -1597,7 +1716,7 @@ static Matrix MatOf(const Grid& g) {
     for (int i = 0; i < g.r; ++i)
         for (int j = 0; j < g.c; ++j) {
             std::string s = Trim(g.cell[(size_t)i * g.c + j]);
-            v[i][j] = s.empty() ? 0.0 : EvalNum(s);
+            v[i][j] = s.empty() ? 0.0 : CellValue(s);
         }
     return Matrix(v);
 }
@@ -1733,71 +1852,117 @@ static void ScreenMatrix() {
         try { g_mres = MatrixRun(); } catch (const std::exception& e) { g_merr = e.what(); g_mres.clear(); }
         g_mscroll = 0;
     });
-    ResultPanel(x, y, w, g_h - y - 10, g_mres, g_merr, g_mscroll, false);
+    ResultPanel(x, y, w, g_h - y - 10, g_mres, g_merr, g_mscroll, false, &g_mhscroll);
 }
 
 // ============================================================
-//                    [6] Data Table (สถิติ / joint table / scatter)
+//                    [6] Data Table  (ไม่จำกัดแถว / คอลัมน์ / จำนวนตาราง)
 // ============================================================
-static Grid g_tab;
-static std::string g_tp[2], g_tquick, g_tres, g_terr;
-static int g_tscroll = 0;
-static const int TAB_MAX_R = 40, TAB_MAX_C = 8;
-static const char* TAB_OPS[7] = {"Column stats", "Computed column", "Transpose", "Scalar x k", "Marginal / joint", "Expected value E[X]", "Scatter plot"};
+static std::vector<Grid> g_tabs;
+static std::vector<char> g_tuse;
+static int g_tsel = 0, g_ttabOff = 0, g_tsig = -1;
+static std::string g_tp[2], g_tquick, g_tres, g_terr, g_trowsS, g_tcolsS;
+static int g_tscroll = 0, g_thscroll = 0;
+static bool g_tlines = false;
+static const long long TAB_MAX_CELLS = 30000000LL;   // กันหน่วยความจำหมด (ไม่จำกัดจำนวนแถว/คอลัมน์ในทางปฏิบัติ)
+static const char* TAB_OPS[9] = {"Column stats", "Computed column", "Transpose", "Scalar x k", "Marginal / joint",
+                                 "Expected value E[X]", "Scatter / line plot", "Add tables", "Multiply tables"};
+static std::string TabName(int i) { return "T" + std::to_string(i + 1); }
+static Grid& CurTab() { return g_tabs[g_tsel]; }
 
-static void TableInit() {
-    if (g_tab.cell.size()) return;
-    g_tab = MakeGrid(5, 2);
-    g_tab.hdr = {"x", "y"};
+static Grid SampleTable() {
+    Grid g = MakeGrid(5, 2);
+    g.hdr = {"x", "y"};
     const char* v[] = {"1", "2", "2", "4", "3", "5", "4", "4", "5", "5"};
-    for (int i = 0; i < 10; ++i) g_tab.cell[i] = v[i];
+    for (int i = 0; i < 10; ++i) g.cell[i] = v[i];
+    return g;
+}
+static void TableInit() {
+    if (!g_tabs.empty()) return;
+    g_tabs.push_back(SampleTable());
+    g_tuse = {1};
 }
 static DataTable TableOf(const Grid& g) {
     DataTable t(g.r, g.c);
     t.setHeaders(g.hdr);
     for (int i = 0; i < g.r; ++i)
         for (int j = 0; j < g.c; ++j) {
-            std::string s = Trim(g.cell[(size_t)i * g.c + j]);
-            t.setCell(i, j, s.empty() ? 0.0 : EvalNum(s));
+            const std::string& s = g.cell[(size_t)i * g.c + j];
+            t.setCell(i, j, s.empty() ? 0.0 : CellValue(s));
         }
     return t;
 }
+// "2,3,5"  "2-6"  "all"  (เลขคอลัมน์เริ่มที่ 1)
+static std::vector<int> ParseColList(const std::string& s0, int ncols, int exclude = -1) {
+    std::string s = Trim(s0);
+    std::vector<int> out;
+    if (s == "all") { for (int c = 0; c < ncols; ++c) if (c != exclude) out.push_back(c); }
+    else for (auto& tok : SplitTop(s, ", ;")) {
+        size_t d = tok.find('-');
+        if (d != std::string::npos && d > 0) {
+            int a = atoi(tok.substr(0, d).c_str()), b = atoi(tok.substr(d + 1).c_str());
+            if (a > b) std::swap(a, b);
+            for (int k = a; k <= b; ++k) out.push_back(k - 1);
+        } else out.push_back(atoi(tok.c_str()) - 1);
+    }
+    if (out.empty()) throw std::runtime_error("Enter column numbers like  2   or  2,3,4   or  2-5   or  all");
+    for (int c : out) if (c < 0 || c >= ncols) throw std::runtime_error("Column number out of range (1.." + std::to_string(ncols) + ")");
+    return out;
+}
 static std::string TableRun() {
-    DataTable t = TableOf(g_tab);
+    Grid& G = CurTab();
+    if (g_top == 7 || g_top == 8) {
+        std::vector<int> used;
+        for (size_t i = 0; i < g_tabs.size(); ++i) if (g_tuse[i]) used.push_back((int)i);
+        if (used.size() < 2) throw std::runtime_error("Tick at least 2 tables with the [x] boxes next to the tabs");
+        DataTable R = TableOf(g_tabs[used[0]]);
+        std::string head = TabName(used[0]);
+        for (size_t k = 1; k < used.size(); ++k) {
+            DataTable B = TableOf(g_tabs[used[k]]);
+            R = (g_top == 7) ? TableCalculate::addTables(R, B) : TableCalculate::multiplyTables(R, B);
+            head += (g_top == 7 ? " + " : " x ") + TabName(used[k]);
+        }
+        return head + "  =  (" + std::to_string(R.getRows()) + " x " + std::to_string(R.getCols()) + ")\n" + FormatTable(R);
+    }
+    DataTable t = TableOf(G);
     switch (g_top) {
         case 0: {
             std::string out;
             char buf[256];
-            snprintf(buf, sizeof buf, "%-12s %5s %12s %12s %12s %12s %12s %12s %12s\n", "Column", "n", "sum", "mean", "min", "max", "median", "variance", "stdev");
+            snprintf(buf, sizeof buf, "%-14s %7s %13s %13s %13s %13s %13s %13s %13s\n", "Column", "n", "sum", "mean", "min", "max", "median", "variance", "stdev");
             out += buf;
             for (int c = 0; c < t.getCols(); ++c) {
-                snprintf(buf, sizeof buf, "%-12s %5d %12.6g %12.6g %12.6g %12.6g %12.6g %12.6g %12.6g\n", t.getHeader(c).c_str(), t.getRows(),
+                snprintf(buf, sizeof buf, "%-14s %7d %13.6g %13.6g %13.6g %13.6g %13.6g %13.6g %13.6g\n", t.getHeader(c).substr(0, 14).c_str(), t.getRows(),
                          TableCalculate::sumColumn(t, c), TableCalculate::meanColumn(t, c), TableCalculate::minColumn(t, c),
                          TableCalculate::maxColumn(t, c), TableCalculate::medianColumn(t, c),
                          t.getRows() > 1 ? TableCalculate::varianceColumn(t, c, true) : 0.0,
                          t.getRows() > 1 ? TableCalculate::stdevColumn(t, c, true) : 0.0);
                 out += buf;
             }
-            out += "(variance / stdev are sample statistics)";
+            out += "(variance / stdev are sample statistics;  " + std::to_string(t.getCols()) + " column(s), " + std::to_string(t.getRows()) + " row(s))";
             return out;
         }
         case 1: {
             std::string e = ReplaceAns(Trim(g_tp[0]));
-            if (e.empty()) throw std::runtime_error("Type an expression, e.g.  x^2 + 2*y  (variables = column names, single letters)");
-            std::vector<char> map;
-            static const char def[] = {'x', 'y', 'z', 'w', 'u', 'v', 'p', 'q'};
-            for (int c = 0; c < t.getCols(); ++c) map.push_back(g_tab.hdr[c].size() == 1 && isalpha((unsigned char)g_tab.hdr[c][0]) ? g_tab.hdr[c][0] : def[c % 8]);
+            if (e.empty()) throw std::runtime_error("Type an expression, e.g.  x^2 + 2*y  (variables = column names that are single letters)");
+            static const std::string pool = "xyzwuvpqrstabcdfghijklmno";      // ไม่ใช้ e (ค่าคงที่)
+            std::string used; std::vector<char> map;
+            for (int c = 0; c < t.getCols(); ++c) {
+                char ch = 0;
+                const std::string& h = G.hdr[c];
+                if (h.size() == 1 && isalpha((unsigned char)h[0]) && h[0] != 'e' && used.find(h[0]) == std::string::npos) ch = h[0];
+                else for (char p : pool) if (used.find(p) == std::string::npos) { ch = p; break; }
+                if (!ch) break;
+                used += ch; map.push_back(ch);
+            }
             DataTable res = TableCalculate::applyExpression(t, g_calc, e, map, "result");
-            std::string s = "Expression: " + e + "   (column letters: ";
-            for (size_t c = 0; c < map.size(); ++c) s += std::string(1, map[c]) + (c + 1 < map.size() ? "," : "");
-            return s + ")\n" + FormatTable(res);
+            std::string s = "Expression: " + e + "\nVariables: ";
+            for (size_t c = 0; c < map.size(); ++c) s += std::string(1, map[c]) + "=" + G.hdr[c] + (c + 1 < map.size() ? ", " : "");
+            return s + "\n" + FormatTable(res);
         }
-        case 2: return "Transpose:\n" + FormatTable(TableCalculate::transpose(t));
+        case 2: return "Transpose  (" + std::to_string(t.getCols()) + " x " + std::to_string(t.getRows()) + "):\n" + FormatTable(TableCalculate::transpose(t));
         case 3: { double k = EvalNum(g_tp[0].empty() ? "1" : g_tp[0]); return "Table x " + Fmt(k) + ":\n" + FormatTable(TableCalculate::multiplyScalar(t, k)); }
-        case 4: {
-            DataTable m = TableCalculate::computeMarginalProbabilities(t);
-            return "Joint table with marginal totals (last row / column):\n" + FormatTable(m);
-        }
+        case 4: return "Joint table with marginal totals (last row / column):\n" + FormatTable(TableCalculate::computeMarginalProbabilities(t));
         case 5: {
             int xc = (int)EvalNum(g_tp[0].empty() ? "1" : g_tp[0]) - 1, pc = (int)EvalNum(g_tp[1].empty() ? "2" : g_tp[1]) - 1;
             if (xc < 0 || pc < 0 || xc >= t.getCols() || pc >= t.getCols()) throw std::runtime_error("Column number out of range");
@@ -1806,9 +1971,13 @@ static std::string TableRun() {
             return "E[X] = sum( x * P(x) ) = " + Fmt(ev) + "   (values: column " + std::to_string(xc + 1) + ", probabilities: column " + std::to_string(pc + 1) + ")";
         }
         default: {
-            int xc = (int)EvalNum(g_tp[0].empty() ? "1" : g_tp[0]) - 1, yc = (int)EvalNum(g_tp[1].empty() ? "2" : g_tp[1]) - 1;
-            if (xc < 0 || yc < 0 || xc >= t.getCols() || yc >= t.getCols()) throw std::runtime_error("Column number out of range");
-            PlotSpec sp; sp.kind = GK_SCATTER; sp.table = t; sp.xc = xc; sp.yc = yc; sp.title = "Scatter Plot";
+            int xc = (int)EvalNum(g_tp[0].empty() ? "1" : g_tp[0]) - 1;
+            if (xc < 0 || xc >= t.getCols()) throw std::runtime_error("X column number out of range (1.." + std::to_string(t.getCols()) + ")");
+            auto cols = ParseColList(Trim(g_tp[1]).empty() ? (t.getCols() > 1 ? "2" : "1") : g_tp[1], t.getCols(), xc);
+            PlotSpec sp; sp.kind = GK_SCATTER; sp.table = t; sp.xc = xc; sp.yc = cols[0]; sp.ycs = cols;
+            for (int c : cols) sp.names.push_back(G.hdr[c]);
+            sp.lines = g_tlines;
+            sp.title = g_tlines ? "Line Plot (x = " + G.hdr[xc] + ")" : "Scatter Plot (x = " + G.hdr[xc] + ")";
             return GraphOut(g_gvScatter, sp);
         }
     }
@@ -1818,32 +1987,72 @@ static void TableExec() {
     try { g_tres = TableRun(); } catch (const std::exception& e) { g_terr = e.what(); g_tres.clear(); }
     g_tscroll = 0;
 }
+static void TableSetSize(int r, int c) {
+    if (r < 1 || c < 1) { g_terr = "Rows and columns must be at least 1"; return; }
+    if ((long long)r * c > TAB_MAX_CELLS) { g_terr = "Table too large for memory (limit " + std::to_string(TAB_MAX_CELLS) + " cells)"; return; }
+    ResizeGrid(CurTab(), r, c);
+    g_terr.clear();
+}
 static void ScreenTable() {
     TableInit();
     TopBar("[6] Data Table & Statistics");
     int x = 10, w = g_w - 20, y = 54;
-    DrawText_(x, y, "Edit the table (headers on top, numbers below; expressions allowed). Pick an operation and press Calculate.", COL_DIM, g_fontM);
-    y += FontH(g_fontM) + 6;
-    int gh = DrawGrid(x, y, std::min(w, 900), 7, g_tab, true);
-    y += gh + 8;
+    int n = (int)g_tabs.size();
+    // ---- แท็บตาราง (ไม่จำกัดจำนวน) ----
     {
-        int r = g_tab.r, c = g_tab.c;
-        bool ch1 = Stepper(x, y, "Rows", r, 1, TAB_MAX_R);
-        bool ch2 = Stepper(x + 150, y, "Cols", c, 1, TAB_MAX_C);
-        if (ch1 || ch2) ResizeGrid(g_tab, r, c);
-        int qx = x + 310, qw = std::max(100, w - 310 - 84 - 190);
-        DrawText_(qx, y + 6, "Quick fill", COL_TEXT, g_fontS);
-        TextBox(qx + 84, y, qw, 28, g_tquick, "1,2;3,4;5,6  (rows split by ;)", g_fontM);
-        int qb = qx + 84 + qw + 6;
-        if (DrawButton(qb, y, 78, 28, "Apply", COL_BTN, g_fontM))
-            try { FillGridFromText(g_tab, g_tquick, TAB_MAX_R, TAB_MAX_C); g_terr.clear(); } catch (const std::exception& e) { g_terr = e.what(); }
-        if (DrawButton(qb + 84, y, 100, 28, "Clear cells", COL_CLEAR, g_fontM)) for (auto& s : g_tab.cell) s.clear();
+        int tabW = 80, maxTabs = std::max(1, (w - 300) / tabW);
+        g_ttabOff = std::clamp(g_ttabOff, 0, std::max(0, n - maxTabs));
+        int tx = x;
+        if (n > maxTabs) { if (DrawButton(tx, y, 26, 30, "<", COL_CHIP)) g_ttabOff = std::max(0, g_ttabOff - 1); tx += 30; }
+        for (int i = g_ttabOff; i < std::min(n, g_ttabOff + maxTabs); ++i) {
+            if (DrawButton(tx, y, 40, 30, TabName(i), i == g_tsel ? COL_BTN : COL_CHIP, g_fontS, i == g_tsel)) Defer([i] { g_tsel = i; ResetFocus(); g_tsig = -1; });
+            if (DrawButton(tx + 42, y, 34, 30, g_tuse[i] ? "[x]" : "[ ]", g_tuse[i] ? COL_OK : COL_CHIP, g_fontM)) g_tuse[i] = !g_tuse[i];
+            tx += tabW;
+        }
+        if (n > maxTabs) { if (DrawButton(tx, y, 26, 30, ">", COL_CHIP)) g_ttabOff = std::min(n - maxTabs, g_ttabOff + 1); tx += 30; }
+        if (DrawButton(tx, y, 110, 30, "+ Add table", COL_BTN, g_fontM))
+            Defer([] { g_tabs.push_back(SampleTable()); g_tuse.push_back(0); g_tsel = (int)g_tabs.size() - 1; g_ttabOff = 1 << 20; ResetFocus(); g_tsig = -1; });
+        if (n > 1 && DrawButton(tx + 116, y, 120, 30, "- Remove " + TabName(g_tsel), COL_CLEAR, g_fontM))
+            Defer([] { g_tabs.erase(g_tabs.begin() + g_tsel); g_tuse.erase(g_tuse.begin() + g_tsel); g_tsel = std::min(g_tsel, (int)g_tabs.size() - 1); ResetFocus(); g_tsig = -1; });
         y += 36;
     }
+    Grid& G = CurTab();
+    DrawText_(x, y, TabName(g_tsel) + ": " + std::to_string(G.r) + " rows x " + std::to_string(G.c) + " columns (any size). Edit cells / headers, or paste data with Ctrl+V into Quick fill. Tick [x] tables for Add / Multiply.", COL_DIM, g_fontM);
+    y += FontH(g_fontM) + 6;
+    int maxRows = (g_top == 6) ? 2 : std::clamp((g_h - 600) / 26, 3, 14);
+    y += DrawGrid(x, y, std::min(w, 1000), maxRows, G, true, 96) + 8;
+    // ---- ขนาดตาราง ----
     {
-        int cw = (w - 3 * 4) / 4;
-        for (int i = 0; i < 7; ++i)
-            if (DrawButton(x + (i % 4) * (cw + 4), y + (i / 4) * 32, cw, 28, TAB_OPS[i], i == g_top ? COL_OK : COL_CHIP, g_fontS, i == g_top)) g_top = i;
+        int sig = g_tsel * 1000003 + G.r * 1009 + G.c;
+        if (sig != g_tsig) { g_tsig = sig; g_trowsS = std::to_string(G.r); g_tcolsS = std::to_string(G.c); }
+        DrawText_(x, y + 7, "Rows", COL_TEXT, g_fontS);  TextBox(x + 40, y, 76, 28, g_trowsS, "rows", g_fontM);
+        DrawText_(x + 128, y + 7, "Cols", COL_TEXT, g_fontS); TextBox(x + 166, y, 76, 28, g_tcolsS, "cols", g_fontM);
+        if (DrawButton(x + 252, y, 84, 28, "Set size", COL_BTN, g_fontM))
+            Defer([] { try { TableSetSize((int)EvalNum(g_trowsS), (int)EvalNum(g_tcolsS)); } catch (const std::exception& e) { g_terr = e.what(); } });
+        int bx = x + 348;
+        const char* nm[4] = {"+ Row", "- Row", "+ Col", "- Col"};
+        for (int i = 0; i < 4; ++i)
+            if (DrawButton(bx + i * 66, y, 62, 28, nm[i], COL_CHIP, g_fontM))
+                Defer([i] { Grid& g = CurTab(); TableSetSize(g.r + (i == 0) - (i == 1), g.c + (i == 2) - (i == 3)); });
+        if (DrawButton(bx + 272, y, 100, 28, "Clear cells", COL_CLEAR, g_fontM)) for (auto& s : G.cell) s.clear();
+        y += 36;
+    }
+    // ---- กรอกเร็ว / วางข้อมูล (ซ่อนตอนพล็อตกราฟเพื่อเพิ่มพื้นที่กราฟ) ----
+    if (g_top != 6) {
+        int bw = 100, boxW = std::max(120, w - 84 - 2 * (bw + 6) - 6);
+        DrawText_(x, y + 7, "Quick fill", COL_TEXT, g_fontS);
+        TextBox(x + 84, y, boxW, 28, g_tquick, "paste with Ctrl+V:  x,y;1,2;3,4   (header row optional)", g_fontM);
+        if (DrawButton(x + 84 + boxW + 6, y, bw, 28, "Replace", COL_BTN, g_fontM))
+            Defer([] { try { FillGridFromText(CurTab(), g_tquick, 1 << 24, 1 << 20, false, true); g_terr.clear(); g_tquick.clear(); } catch (const std::exception& e) { g_terr = e.what(); } });
+        if (DrawButton(x + 84 + boxW + 6 + bw + 6, y, bw, 28, "Add rows", COL_BTN, g_fontM))
+            Defer([] { try { FillGridFromText(CurTab(), g_tquick, 1 << 24, 1 << 20, true, false); g_terr.clear(); g_tquick.clear(); } catch (const std::exception& e) { g_terr = e.what(); } });
+        y += 36;
+    }
+    // ---- การดำเนินการ ----
+    {
+        int cw = (w - 4 * 4) / 5;
+        for (int i = 0; i < 9; ++i)
+            if (DrawButton(x + (i % 5) * (cw + 4), y + (i / 5) * 32, cw, 28, TAB_OPS[i], i == g_top ? COL_OK : COL_CHIP, g_fontS, i == g_top)) g_top = i;
         y += 68;
     }
     bool run = g_enter;
@@ -1852,27 +2061,36 @@ static void ScreenTable() {
         if (g_top == 1) { l0 = "Expression"; h0 = "x^2 + 2*y"; }
         else if (g_top == 3) { l0 = "k (scalar)"; h0 = "2"; }
         else if (g_top == 5) { l0 = "X column #"; l1 = "P column #"; }
-        else if (g_top == 6) { l0 = "X column #"; l1 = "Y column #"; }
+        else if (g_top == 6) { l0 = "X column #"; l1 = "Y column(s)"; }
         int px = x;
         if (l0) {
-            DrawText_(px, y + 6, l0, COL_TEXT, g_fontS); px += TextW(g_fontS, l0) + 8;
-            int bw2 = (g_top == 1) ? 300 : 70;
-            TextBox(px, y, bw2, 28, g_tp[0], g_top >= 5 ? "1" : h0, g_fontM); px += bw2 + 10;
+            DrawText_(px, y + 7, l0, COL_TEXT, g_fontS); px += TextW(g_fontS, l0) + 8;
+            int bw2 = (g_top == 1) ? 300 : 60;
+            TextBox(px, y, bw2, 28, g_tp[0], g_top >= 5 ? "1" : h0, g_fontM); px += bw2 + 12;
         }
-        if (l1) { DrawText_(px, y + 6, l1, COL_TEXT, g_fontS); px += TextW(g_fontS, l1) + 8; TextBox(px, y, 70, 28, g_tp[1], "2", g_fontM); px += 80; }
-        if (!l0) DrawText_(px, y + 6, g_top == 0 ? "Statistics of every column." : g_top == 4 ? "Enter joint probabilities; totals are added." : "No parameters.", COL_DIM, g_fontS);
+        if (l1) {
+            DrawText_(px, y + 7, l1, COL_TEXT, g_fontS); px += TextW(g_fontS, l1) + 8;
+            int bw2 = (g_top == 6) ? 170 : 60;
+            TextBox(px, y, bw2, 28, g_tp[1], g_top == 6 ? "2 / 2,3 / 2-5 / all" : "2", g_fontM); px += bw2 + 12;
+        }
+        if (g_top == 6) {
+            if (DrawButton(px, y, 74, 28, "Points", !g_tlines ? COL_OK : COL_CHIP, g_fontM, !g_tlines)) g_tlines = false;
+            if (DrawButton(px + 78, y, 74, 28, "Lines", g_tlines ? COL_OK : COL_CHIP, g_fontM, g_tlines)) g_tlines = true;
+            px += 160;
+        }
+        if (!l0) DrawText_(px, y + 7, g_top == 0 ? "Statistics of every column." : g_top == 4 ? "Enter joint probabilities; totals are added." :
+                                         (g_top >= 7 ? "Uses all ticked tables in order (T1, T2, ...)." : "No parameters."), COL_DIM, g_fontS);
         if (DrawButton(std::max(px + 10, w - 170), y - 2, 160, 34, "Calculate", COL_OK)) run = true;
         y += 42;
     }
-    if (g_top == 6) {      // กราฟ scatter: แถบควบคุมซูม/เลื่อนซ้าย-ขวา-ขึ้น-ลง
+    if (g_top == 6) {      // กราฟ: ซูม / เลื่อนซ้าย-ขวา-ขึ้น-ลง / กำหนดช่วง x,y / หลายซีรีส์
         bool pc = false;
         auto rr = []() { if (!g_tres.empty() || !g_terr.empty()) Defer(TableExec); };
         y += GraphControls(x, y, w, g_gvScatter, rr, pc);
         if (pc) run = true;
     }
     if (run) Defer(TableExec);
-    std::string err = g_terr;
-    ResultPanel(x, y, w, g_h - y - 10, g_tres, err, g_tscroll, false);
+    ResultPanel(x, y, w, g_h - y - 10, g_tres, g_terr, g_tscroll, false, &g_thscroll);
 }
 
 // ============================================================
@@ -1916,6 +2134,28 @@ static XFontStruct* LoadFont(const char* a, const char* b, const char* c) {
     if (!f) f = XLoadQueryFont(g_dpy, c);
     return f;
 }
+static Atom g_atomClip = 0, g_atomProp = 0;
+static void PasteText(std::string s) {
+    std::string o;
+    for (char c : s) {
+        if (c == '\r') continue;
+        if (c == '\n') o += ';';
+        else if (c == '\t') o += ',';
+        else if ((unsigned char)c >= 32 && (unsigned char)c < 127) o += c;
+    }
+    while (!o.empty() && o.back() == ';') o.pop_back();
+    if (o.empty()) return;
+    if (g_screen == S_CALC) CalcInsert(o);
+    else if (g_focusStr) *g_focusStr += o;
+}
+static void RequestPaste(Atom sel) { XConvertSelection(g_dpy, sel, XA_STRING, g_atomProp, g_win, CurrentTime); }
+static void HandleSelection(const XSelectionEvent& se) {
+    if (se.property == None) return;
+    Atom type; int fmt; unsigned long n, after; unsigned char* data = nullptr;
+    if (XGetWindowProperty(g_dpy, g_win, se.property, 0, 1 << 24, True, AnyPropertyType, &type, &fmt, &n, &after, &data) != Success || !data) return;
+    PasteText(std::string((char*)data, n * (fmt / 8)));
+    XFree(data);
+}
 static void TypeChar(char c) {
     if (g_screen == S_CALC) CalcInsert(std::string(1, c));
     else if (g_focusStr) *g_focusStr += c;
@@ -1930,10 +2170,12 @@ static void FocusNext(bool back) {
     g_focusStr = g_tabPrev[idx];
 }
 
-int main_gui(){
+int main_gui() {
     g_dpy = XOpenDisplay(nullptr);
     if (!g_dpy) { fprintf(stderr, "Cannot open X display\n"); return 1; }
     int screen = DefaultScreen(g_dpy);
+    g_atomClip = XInternAtom(g_dpy, "CLIPBOARD", False);
+    g_atomProp = XInternAtom(g_dpy, "PASTE_BUF", False);
     const int W0 = 1040, H0 = 800;
     g_win = XCreateSimpleWindow(g_dpy, RootWindow(g_dpy, screen), 0, 0, W0, H0, 0,
                                 BlackPixel(g_dpy, screen), WhitePixel(g_dpy, screen));
@@ -1971,8 +2213,11 @@ int main_gui(){
         case ButtonPress:
             ui.mx = e.xbutton.x; ui.my = e.xbutton.y;
             if (e.xbutton.button == Button1) ui.down = ui.pressed = true;
-            else if (e.xbutton.button == Button4) g_wheel = -1;
-            else if (e.xbutton.button == Button5) g_wheel = 1;
+            else if (e.xbutton.button == Button2) { RequestPaste(XA_PRIMARY); }
+            else if (e.xbutton.button == Button4) { if (e.xbutton.state & ShiftMask) g_wheelH = -1; else g_wheel = -1; }
+            else if (e.xbutton.button == Button5) { if (e.xbutton.state & ShiftMask) g_wheelH = 1; else g_wheel = 1; }
+            else if (e.xbutton.button == 6) g_wheelH = -1;
+            else if (e.xbutton.button == 7) g_wheelH = 1;
             break;
         case ButtonRelease:
             if (e.xbutton.button == Button1) { ui.mx = e.xbutton.x; ui.my = e.xbutton.y; ui.down = false; ui.released = true; extra = true; }
@@ -1990,11 +2235,16 @@ int main_gui(){
             else if (ks == XK_Delete) { if (g_screen == S_CALC) CalcClear(); else if (g_focusStr) g_focusStr->clear(); }
             else if (ks == XK_Up) g_wheelKey = -1;
             else if (ks == XK_Down) g_wheelKey = 1;
+            else if (ks == XK_Left) g_hKey = -1;
+            else if (ks == XK_Right) g_hKey = 1;
+            else if ((e.xkey.state & ControlMask) && (ks == XK_v || ks == XK_V)) RequestPaste(g_atomClip);
+            else if (ks == XK_Insert && (e.xkey.state & ShiftMask)) RequestPaste(g_atomClip);
             else if (ks == XK_Prior) g_wheelKey = -8;
             else if (ks == XK_Next) g_wheelKey = 8;
             else if (n == 1 && isprint((unsigned char)buf[0])) TypeChar(buf[0]);
             break;
         }
+        case SelectionNotify: HandleSelection(e.xselection); extra = true; break;
         case ClientMessage:
             if ((Atom)e.xclient.data.l[0] == wmDelete) running = false;
             break;
