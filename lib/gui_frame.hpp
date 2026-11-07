@@ -1,12 +1,12 @@
-//          g++ -std=c++17 *.cpp -o calc -lX11
-#include "lib/algebra.hpp"
-#include "lib/Alpha_solver_eq.hpp"
-#include "lib/Calculator_calculus.hpp"
-#include "lib/function_solver.hpp"
-#include "lib/math_graph.hpp"
-#include "lib/matrix.hpp"
-#include "lib/menu.hpp"
-#include "lib/table_calculate.hpp"
+//          g++ -std=c++17 *.cpp -o calc -lX11      
+#include "../lib/algebra.hpp"
+#include "../lib/Alpha_solver_eq.hpp"
+#include "../lib/Calculator_calculus.hpp"
+#include "../lib/function_solver.hpp"
+#include "../lib/math_graph.hpp"
+#include "../lib/matrix.hpp"
+#include "../lib/menu.hpp"
+#include "../lib/table_calculate.hpp"
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -256,7 +256,96 @@ static std::vector<std::string> SplitTop(const std::string& s, const std::string
     if (!Trim(cur).empty()) out.push_back(Trim(cur));
     return out;
 }
-static double EvalNum(const std::string& s) { return g_calc.evaluate(ReplaceAns(s)); }
+// ---------- ตัวแปร a-z, A-Z และพารามิเตอร์ (ใช้ความสามารถของ AlphaSolverEq) ----------
+// ช่อง Vars (แถบบนสุด) เก็บค่าตัวแปร/พารามิเตอร์ เช่น  a=2, b=3  -> แทนค่าให้ทุกสูตรในทุกหมวดอัตโนมัติ
+static std::string g_paramStr;
+static std::string StripWord(const std::string& s, const std::string& w) {     // แทนคำ (ทั้งคำ) ด้วย 0 เช่น inf
+    std::string out;
+    for (size_t i = 0; i < s.size();) {
+        if (isalpha((unsigned char)s[i])) {
+            size_t j = i;
+            while (j < s.size() && isalpha((unsigned char)s[j])) ++j;
+            std::string word = s.substr(i, j - i);
+            out += (word == w) ? "0" : word;
+            i = j;
+        } else out += s[i++];
+    }
+    return out;
+}
+static std::vector<char> FindVars(const std::string& e) { return AlphaSolverEq::findVariables(StripWord(e, "inf")); }
+static const std::map<char, double>& ParamMap() {
+    static std::string lastStr = "\x01";
+    static std::map<char, double> lastMap;
+    static std::string lastErr;
+    if (lastStr != g_paramStr) {
+        lastStr = g_paramStr; lastMap.clear(); lastErr.clear();
+        try {
+            for (auto& t : SplitTop(g_paramStr, ",;")) {
+                size_t eq = t.find('=');
+                std::string k = eq == std::string::npos ? "" : Trim(t.substr(0, eq));
+                if (k.size() != 1 || !isalpha((unsigned char)k[0]))
+                    throw std::runtime_error("use the form  a=2, b=3  (one letter a-z / A-Z = value)");
+                if (k[0] == 'e') throw std::runtime_error("'e' is the constant 2.718..., choose another letter");
+                lastMap[k[0]] = g_calc.evaluate(ReplaceAns(t.substr(eq + 1)));
+            }
+        } catch (const std::exception& ex) { lastErr = ex.what(); lastMap.clear(); }
+    }
+    if (!lastErr.empty()) throw std::runtime_error("Vars box: " + lastErr);
+    return lastMap;
+}
+static void SetParam(char k, double v) {
+    std::map<char, double> mp = ParamMap();
+    mp[k] = v;
+    std::string s;
+    for (auto& kv : mp) {
+        char buf[64]; snprintf(buf, sizeof buf, "%.15g", kv.second);
+        s += (s.empty() ? "" : ", ") + std::string(1, kv.first) + "=" + buf;
+    }
+    g_paramStr = s;
+}
+// แทนค่าพารามิเตอร์ลงในสูตร (ยกเว้นตัวอักษรใน keep)
+static std::string ApplyParamsKeep(const std::string& e, const std::string& keep) {
+    std::map<char, double> mp = ParamMap();
+    for (char c : keep) mp.erase(c);
+    if (mp.empty()) return e;
+    return AlphaSolverEq::substituteVariables(e, mp);
+}
+static std::string ApplyParams(const std::string& e) { return ApplyParamsKeep(e, ""); }
+struct Prepared { std::string sub; std::string xexpr; char var = 'x'; };
+// เตรียมสูตรตัวแปรเดียว: แทนพารามิเตอร์, หาตัวแปร (x ก่อน, ไม่งั้นตัวที่เหลือตัวเดียว), แปลงเป็น x ให้ Calculator
+static Prepared PrepVar(const std::string& raw, char varField = '\0', bool allowFree = false) {
+    std::string e = ReplaceAns(raw);
+    const auto& P = ParamMap();
+    std::vector<char> V = FindVars(e), unb;
+    for (char c : V) if (!P.count(c)) unb.push_back(c);
+    char var = varField;
+    if (!var) {
+        if (std::find(unb.begin(), unb.end(), 'x') != unb.end()) var = 'x';
+        else if (unb.size() == 1) var = unb[0];
+        else if (unb.empty()) var = 'x';
+        else {
+            std::string list;
+            for (char c : unb) { if (!list.empty()) list += ", "; list += c; }
+            throw std::runtime_error("Ambiguous variable (found: " + list + "). Fill in the Variable box, or give values in the Vars box.");
+        }
+    }
+    if (!isalpha((unsigned char)var)) throw std::invalid_argument("Variable name must be a letter (a-z or A-Z).");
+    Prepared p;
+    p.var = var;
+    p.sub = ApplyParamsKeep(e, std::string(1, var));
+    if (allowFree) { p.xexpr = p.sub; return p; }          // สัญลักษณ์: ตัวอักษรอื่นเป็นค่าคงที่ได้
+    for (char c : FindVars(p.sub))
+        if (c != var) throw std::runtime_error(std::string("Unknown variable '") + c + "'. Give it a value in the Vars box (top right), e.g.  " + c + "=2");
+    p.xexpr = AlphaSolverEq::normalizeVariable(p.sub, var);
+    return p;
+}
+static double EvalNum(const std::string& s) {
+    std::string e = ApplyParams(ReplaceAns(s));
+    auto vs = FindVars(e);
+    if (!vs.empty())
+        throw std::runtime_error(std::string("Unknown variable '") + vs[0] + "'. Give it a value in the Vars box (top right), e.g.  " + vs[0] + "=2");
+    return g_calc.evaluate(e);
+}
 // ค่าในเซลล์: ถ้าเป็นตัวเลขล้วนอ่านตรง ๆ (เร็ว สำหรับตารางใหญ่) ไม่งั้นประเมินเป็นสูตร
 static double CellValue(const std::string& raw) {
     const char* s = raw.c_str();
@@ -274,11 +363,8 @@ static std::vector<double> ParseList(const std::string& s, const char* what = "n
     if (v.empty()) throw std::runtime_error(std::string("Please enter ") + what + " separated by commas");
     return v;
 }
-// ตัวแปรหลายตัวแปรเดียวกันใน Calculator ผูกกับ x; แปลงตัวแปรอื่นให้เป็น x ถ้าทำได้
-static std::string Norm(const std::string& expr) {
-    std::string e = ReplaceAns(expr);
-    try { return AlphaSolverEq::normalizeVariable(e); } catch (...) { return e; }
-}
+// สูตรตัวแปรเดียว (ตัวแปร a-z/A-Z ใดก็ได้ + พารามิเตอร์ใน Vars) -> สูตรในตัวแปร x สำหรับ Calculator
+static std::string Norm(const std::string& expr) { return PrepVar(expr).xexpr; }
 // ช่วง เช่น "[0,inf)", "(-1,5]", "R"
 static Interval ParseInterval(const std::string& s) {
     std::string t = Trim(s);
@@ -470,9 +556,11 @@ static std::string Req(Feature& f, int i) {
     if (s.empty()) throw std::runtime_error("Please fill in: " + f.fields[i].label);
     return s;
 }
-static double Num(Feature& f, int i) { return g_calc.evaluate(Req(f, i)); }
-static double NumOr(Feature& f, int i, double d) { return Opt(f, i).empty() ? d : g_calc.evaluate(Opt(f, i)); }
+static double Num(Feature& f, int i) { return EvalNum(Req(f, i)); }
+static double NumOr(Feature& f, int i, double d) { return Opt(f, i).empty() ? d : EvalNum(Opt(f, i)); }
 static char VarOf(Feature& f, int i) { std::string s = Opt(f, i); return s.empty() ? '\0' : s[0]; }
+// เตรียมสูตรจากช่อง exprIdx โดยใช้ช่อง varIdx (ว่าง = ตรวจหาอัตโนมัติ; ตัวแปร a-z, A-Z)
+static Prepared PV(Feature& f, int exprIdx, int varIdx, bool allowFree = false) { return PrepVar(Req(f, exprIdx), varIdx >= 0 ? VarOf(f, varIdx) : '\0', allowFree); }
 static int Pick(Feature& f, int i) { return f.fields[i].choice; }
 static std::vector<double> ParseSet(const std::string& s) {
     std::string t = s;
@@ -492,6 +580,8 @@ struct PlotSpec {
     int xc = 0, yc = 1;
     std::vector<int> ycs;                // หลายซีรีส์ (คอลัมน์ y หลายตัว) ถ้าไม่ว่างจะใช้แทน yc
     std::vector<std::string> names;      // ชื่อซีรีส์สำหรับคำอธิบาย
+    std::string disp1, disp2;            // สูตรเดิม (ตัวแปรเดิม) สำหรับแสดงชื่อกราฟ
+    char var = 'x';
     bool lines = false;                  // ลากเส้นเชื่อมจุด
 };
 struct GView {
@@ -549,17 +639,19 @@ static std::string CustomRender(const PlotSpec& s, int W, int H, double x0, doub
     c.axes();
     double dx = (x1 - x0) / (W - 1);
     std::string title, footer;
+    auto D1 = [&]() { return s.disp1.empty() ? s.e1 : s.disp1; };
+    auto D2 = [&]() { return s.disp2.empty() ? s.e2 : s.disp2; };
     auto tgt = [](double v) { return std::isinf(v) ? (v > 0 ? std::string("inf") : std::string("-inf")) : Fmt(v); };
     switch (s.kind) {
     case GK_FUNC: {
-        title = "f(x) = " + s.e1;
+        title = "f(" + std::string(1, s.var) + ") = " + D1();
         for (int i = 0; i < W; ++i) { double x = x0 + i * dx, y; if (EvalAt(s.e1, x, y)) c.mark(x, y, '*'); }
         break; }
     case GK_DERIV: {
         double slope = g_calc.derivative(s.e1, s.a);
         g_calc.setVariable('x', s.a);
         double ya = g_calc.evaluate(s.e1);
-        title = "f(x) = " + s.e1 + " | Tangent at x=" + Fmt(s.a);
+        title = "f(" + std::string(1, s.var) + ") = " + D1() + " | Tangent at " + std::string(1, s.var) + "=" + Fmt(s.a);
         for (int i = 0; i < W; ++i) {
             double x = x0 + i * dx, y;
             if (!EvalAt(s.e1, x, y)) continue;
@@ -585,7 +677,7 @@ static std::string CustomRender(const PlotSpec& s, int W, int H, double x0, doub
     case GK_AREA2: {
         double a = std::min(s.a, s.b), b = std::max(s.a, s.b), area = 0; bool has = true;
         try { area = g_calc.integral("abs((" + s.e1 + ")-(" + s.e2 + "))", a, b); } catch (...) { has = false; }
-        title = "Area between f1(x)=[*] " + s.e1 + " and f2(x)=[~] " + s.e2;
+        title = "Area between f1=[*] " + D1() + " and f2=[~] " + D2();
         for (int i = 0; i < W; ++i) {
             double x = x0 + i * dx, v1, v2;
             if (!EvalAt(s.e1, x, v1) || !EvalAt(s.e2, x, v2)) continue;
@@ -620,7 +712,7 @@ static std::string CustomRender(const PlotSpec& s, int W, int H, double x0, doub
         }
         break; }
     case GK_INVERSE: {
-        title = "f(x)=[*] " + s.e1 + "   f^-1(x)=[o]   y=x [.]";
+        title = "f=[*] " + D1() + "   f^-1=[o]   y=x [.]";
         for (int i = 0; i < W; ++i) { double x = x0 + i * dx; c.markBlank(x, x, '.'); }
         int samples = std::max(W, H) * 8;
         std::vector<std::pair<double, double>> pts;
@@ -729,7 +821,13 @@ static std::string GraphOut(GView& v, const PlotSpec& s) {
     }
     out = CleanAscii(out);
     ParseRanges(out, v);
+    if (s.var != 'x') out += std::string(" (variable '") + s.var + "' is drawn on the horizontal axis; the plotter labels it x)\n";
     return out;
+}
+static PlotSpec SpecV(int kind, const Prepared& p, double a = 0, double b = 0, const Prepared* p2 = nullptr) {
+    PlotSpec s; s.kind = kind; s.e1 = p.xexpr; s.disp1 = p.sub; s.var = p.var; s.a = a; s.b = b;
+    if (p2) { s.e2 = p2->xexpr; s.disp2 = p2->sub; }
+    return s;
 }
 static PlotSpec Spec(int kind, const std::string& e1, double a = 0, double b = 0, const std::string& e2 = "") {
     PlotSpec s; s.kind = kind; s.e1 = e1; s.e2 = e2; s.a = a; s.b = b; return s;
@@ -752,53 +850,57 @@ static void BuildCatalog() {
     }
     // ===================== [2] Calculus =====================
     {
-        Category c{"Calculus Solver", "Derivative, Integral, Limit (numeric & symbolic)", {}};
-        c.features.push_back(MkF("Derivative  d/dx f(x) at x0", "Numeric derivative of f at a point.",
-            {TF("f(x)", "e.g. x^2 + sin(x)"), TF("x0  (point)", "e.g. 2")},
+        Category c{"Calculus Solver", "Derivative, Integral, Limit - any variable a-z / A-Z", {}};
+        const char* VH = "x, t, a ...";
+        c.features.push_back(MkF("Derivative  d/dx f(x) at x0", "Numeric derivative at a point. Any variable letter works (blank = auto-detect).",
+            {TF("f(x)", "e.g. x^2 + sin(x)   or   t^3 + 2t"), TF("x0  (point)", "e.g. 2"), TF("Variable (blank = auto)", VH)},
             [](Feature& f) -> std::string {
-                std::string e = Norm(Req(f, 0)); double x0 = Num(f, 1);
-                double v = g_calc.derivative(e, x0); SetAns(v);
-                return "f'(" + Fmt(x0) + ") = " + Fmt(v);
-            }, {{"x^2+sin(x)", "2"}, {"e^x", "0"}}));
+                Prepared p = PV(f, 0, 2); double x0 = Num(f, 1);
+                double v = g_calc.derivative(p.xexpr, x0); SetAns(v);
+                std::string V(1, p.var);
+                return "d/d" + V + " f   at " + V + " = " + Fmt(x0) + "   :   " + Fmt(v);
+            }, {{"x^2+sin(x)", "2", ""}, {"t^3+2t", "1", ""}}));
         c.features.push_back(MkF("Definite / Improper Integral", "Integral of f over [a, b]. Use inf / -inf for improper integrals.",
-            {TF("f(x)", "e.g. x^2"), TF("a  (lower)", "e.g. 0"), TF("b  (upper)", "e.g. 3  or  inf")},
+            {TF("f(x)", "e.g. x^2   or   t^2 + k   (k set in Vars)"), TF("a  (lower)", "e.g. 0"), TF("b  (upper)", "e.g. 3  or  inf"), TF("Variable (blank = auto)", VH)},
             [](Feature& f) -> std::string {
-                std::string e = Norm(Req(f, 0)); double a = Num(f, 1), b = Num(f, 2);
-                double v = g_calc.integral(e, a, b); SetAns(v);
-                return "Integral [" + Fmt(a) + " -> " + Fmt(b) + "] f(x) dx = " + Fmt(v);
-            }, {{"x^2", "0", "3"}, {"1/(x^2+1)", "0", "inf"}, {"e^(-x)", "0", "inf"}}));
+                Prepared p = PV(f, 0, 3); double a = Num(f, 1), b = Num(f, 2);
+                double v = g_calc.integral(p.xexpr, a, b); SetAns(v);
+                return "Integral [" + Fmt(a) + " -> " + Fmt(b) + "] f d" + std::string(1, p.var) + " = " + Fmt(v);
+            }, {{"x^2", "0", "3", ""}, {"1/(t^2+1)", "0", "inf", ""}, {"e^(-x)", "0", "inf", ""}}));
         c.features.push_back(MkF("Indefinite Integral F(x)", "F(x0) = integral of f from x_ref to x0.",
-            {TF("f(x)", "e.g. 2x"), TF("x0  (evaluate at)", "e.g. 3"), TF("x_ref  (start, default 0)", "0", "0")},
+            {TF("f(x)", "e.g. 2x"), TF("x0  (evaluate at)", "e.g. 3"), TF("x_ref  (start, default 0)", "0", "0"), TF("Variable (blank = auto)", VH)},
             [](Feature& f) -> std::string {
-                std::string e = Norm(Req(f, 0)); double x0 = Num(f, 1), xr = NumOr(f, 2, 0.0);
-                double v = g_calc.indefiniteIntegral(e, x0, xr); SetAns(v);
-                return "F(" + Fmt(x0) + ") = Integral[" + Fmt(xr) + " -> " + Fmt(x0) + "] f(x) dx = " + Fmt(v);
-            }, {{"2*x", "3", "0"}}));
+                Prepared p = PV(f, 0, 3); double x0 = Num(f, 1), xr = NumOr(f, 2, 0.0);
+                double v = g_calc.indefiniteIntegral(p.xexpr, x0, xr); SetAns(v);
+                std::string V(1, p.var);
+                return "F(" + Fmt(x0) + ") = Integral[" + V + ": " + Fmt(xr) + " -> " + Fmt(x0) + "] f d" + V + " = " + Fmt(v);
+            }, {{"2*x", "3", "0", ""}, {"2*s", "3", "0", ""}}));
         c.features.push_back(MkF("Limit  lim x->a f(x)", "Two-sided or one-sided limit. a may be inf / -inf.",
-            {TF("f(x)", "e.g. sin(x)/x"), TF("a  (x tends to)", "e.g. 0"), CF("Direction", {"both sides", "right (a+)", "left (a-)"})},
+            {TF("f(x)", "e.g. sin(x)/x   or   sin(t)/t"), TF("a  (variable tends to)", "e.g. 0"), CF("Direction", {"both sides", "right (a+)", "left (a-)"}), TF("Variable (blank = auto)", VH)},
             [](Feature& f) -> std::string {
-                std::string e = Norm(Req(f, 0)); double a = Num(f, 1);
+                Prepared p = PV(f, 0, 3); double a = Num(f, 1);
                 char side = Pick(f, 2) == 1 ? '+' : Pick(f, 2) == 2 ? '-' : '\0';
-                double v = g_calc.limit(e, a, 1e-6, side); SetAns(v);
-                return "lim x->" + Fmt(a) + (side ? std::string(1, side) : std::string()) + " f(x) = " + Fmt(v);
-            }, {{"sin(x)/x", "0", "0"}, {"1/x", "0", "1"}}));
-        c.features.push_back(MkF("Symbolic Derivative  f'(x)", "Returns f'(x) as a formula.",
-            {TF("f(x)", "e.g. x^2 + sin(x)"), TF("Variable (blank = x)", "x")},
+                double v = g_calc.limit(p.xexpr, a, 1e-6, side); SetAns(v);
+                return "lim " + std::string(1, p.var) + "->" + Fmt(a) + (side ? std::string(1, side) : std::string()) + " f = " + Fmt(v);
+            }, {{"sin(x)/x", "0", "0", ""}, {"1/x", "0", "1", ""}, {"sin(t)/t", "0", "0", ""}}));
+        c.features.push_back(MkF("Symbolic Derivative  f'(x)", "Returns f'(x) as a formula. Other letters are treated as constants.",
+            {TF("f(x)", "e.g. x^2 + sin(x)   or   a*t^2"), TF("Variable (blank = auto)", VH)},
             [](Feature& f) -> std::string {
-                char v = VarOf(f, 1); if (!v) v = 'x';
-                return "f'(" + std::string(1, v) + ") = " + g_calc.symbolicDerivative(Req(f, 0), v);
-            }, {{"x^2+sin(x)", ""}, {"x*e^x", ""}}));
-        c.features.push_back(MkF("Symbolic Indefinite Integral  F(x)", "Returns F(x) as a formula (without + C).",
-            {TF("f(x)", "e.g. x^2 + sin(x)"), TF("Variable (blank = x)", "x")},
+                Prepared p = PV(f, 0, 1, true);
+                return "d/d" + std::string(1, p.var) + "  = " + g_calc.symbolicDerivative(p.sub, p.var);
+            }, {{"x^2+sin(x)", ""}, {"x*e^x", ""}, {"a*t^2+b*t", "t"}}));
+        c.features.push_back(MkF("Symbolic Indefinite Integral  F(x)", "Returns F(x) as a formula (without + C). Other letters are constants.",
+            {TF("f(x)", "e.g. x^2 + sin(x)   or   a*t"), TF("Variable (blank = auto)", VH)},
             [](Feature& f) -> std::string {
-                char v = VarOf(f, 1); if (!v) v = 'x';
-                return "F(" + std::string(1, v) + ") = " + g_calc.symbolicIntegral(Req(f, 0), v) + " + C";
-            }, {{"x^2+sin(x)", ""}, {"1/(x^2+1)", ""}}));
+                Prepared p = PV(f, 0, 1, true);
+                return "Integral d" + std::string(1, p.var) + "  = " + g_calc.symbolicIntegral(p.sub, p.var) + " + C";
+            }, {{"x^2+sin(x)", ""}, {"1/(x^2+1)", ""}, {"a*t+b", "t"}}));
         g_cats.push_back(c);
     }
     // ===================== [3] Equation Solver =====================
     {
-        Category c{"Alpha Equation Solver", "Polynomial, factorization, f(x)=0, systems of equations", {}};
+        Category c{"Alpha Equation Solver", "Polynomial, factorization, f(x)=0, systems - any variable a-z / A-Z", {}};
+        const char* VH = "x, t, a ... (blank = auto)";
         c.features.push_back(MkF("Polynomial Solver (degree 2, 3, 4, N)", "Coefficients from the highest power down, e.g. x^2-3x+2 -> 1 -3 2",
             {TF("Coefficients", "1 -3 2")},
             [](Feature& f) -> std::string {
@@ -811,74 +913,81 @@ static void BuildCatalog() {
                 if (!roots.empty()) SetAns(roots[0].real());
                 return t;
             }, {{"1 -3 2"}, {"1 0 0 -1"}, {"1 0 -5 0 4"}}));
-        c.features.push_back(MkF("Polynomial Factorization", "Factor a polynomial into linear/quadratic factors.",
-            {TF("Coefficients", "1 -3 2"), TF("Variable (blank = x)", "x")},
+        c.features.push_back(MkF("Polynomial Factorization", "Factor a polynomial. Choose the variable letter for the printed factors.",
+            {TF("Coefficients", "1 -3 2"), TF("Variable (blank = x)", "x, t, a, ...")},
             [](Feature& f) -> std::string {
                 auto co = ParseList(Req(f, 0), "coefficients");
                 char v = VarOf(f, 1); if (!v) v = 'x';
                 return g_calc.solver().factorizePolynomial(co, v);
-            }, {{"1 -6 11 -6", ""}}));
-        c.features.push_back(MkF("General Equation  f(x) = 0", "Numeric root finder (Newton).",
-            {TF("f(x)  (= 0)", "e.g. cos(x) - x"), TF("Initial guess", "1", "1"), TF("Variable (blank = auto)", "x")},
+            }, {{"1 -6 11 -6", ""}, {"1 -3 2", "t"}}));
+        c.features.push_back(MkF("General Equation  f(x) = 0", "Numeric root finder (Newton). Any variable letter; parameters from the Vars box.",
+            {TF("f(x)  (= 0)", "e.g. cos(x) - x   or   cos(t) - t"), TF("Initial guess", "1", "1"), TF("Variable", VH)},
             [](Feature& f) -> std::string {
-                double v = g_calc.solver().solveGeneralEquation(g_calc, Req(f, 0), NumOr(f, 1, 1.0), 1000, 1e-7, VarOf(f, 2));
-                SetAns(v); return "x = " + Fmt(v);
-            }, {{"cos(x)-x", "1", ""}, {"x^3-2x-5", "2", ""}}));
-        c.features.push_back(MkF("Derivative Equation  f'(x) = target", "Find x where f'(x) equals a value (target 0 = critical point).",
-            {TF("f(x)", "e.g. x^3 - 3x"), TF("Target value", "0", "0"), TF("Initial guess", "1", "1"), TF("Variable (blank = auto)", "x")},
-            [](Feature& f) -> std::string {
-                double v = g_calc.solver().solveDerivativeEq(g_calc, Req(f, 0), NumOr(f, 1, 0.0), NumOr(f, 2, 1.0), 1000, 1e-7, VarOf(f, 3));
-                SetAns(v); return "x = " + Fmt(v);
-            }, {{"x^3-3x", "0", "2", ""}}));
-        c.features.push_back(MkF("Integral Bound  Integral[a..b] f dx = target", "Find the upper bound b.",
-            {TF("f(x)", "e.g. 2x"), TF("a  (lower bound)", "0", "0"), TF("Target value", "e.g. 9"), TF("Initial guess", "1", "1"), TF("Variable (blank = auto)", "x")},
-            [](Feature& f) -> std::string {
-                double v = g_calc.solver().solveIntegralBound(g_calc, Req(f, 0), NumOr(f, 1, 0.0), Num(f, 2), NumOr(f, 3, 1.0), 1000, 1e-7, VarOf(f, 4));
-                SetAns(v); return "b = " + Fmt(v);
-            }, {{"2x", "0", "9", "1", ""}}));
-        c.features.push_back(MkF("Limit Equation  lim x->a f(x) = target", "Find a such that the limit equals target.",
-            {TF("f(x)", "e.g. (x^2-1)/(x-1) - 5"), TF("Target value", "e.g. 0"), TF("Initial guess", "1", "1"), TF("Variable (blank = auto)", "x")},
-            [](Feature& f) -> std::string {
-                double v = g_calc.solver().solveLimitEq(g_calc, Req(f, 0), Num(f, 1), NumOr(f, 2, 1.0), 1000, 1e-7, VarOf(f, 3));
-                SetAns(v); return "a = " + Fmt(v);
-            }, {{"x^2", "9", "2", ""}}));
-        c.features.push_back(MkF("Indefinite Integral Equation  F(x) = target", "Find x where F(x) (integral from x_ref) equals target.",
-            {TF("f(x)", "e.g. 2x"), TF("Target value", "e.g. 16"), TF("x_ref (default 0)", "0", "0"), TF("Initial guess", "1", "1"), TF("Variable (blank = auto)", "x")},
-            [](Feature& f) -> std::string {
-                double v = g_calc.solver().solveIndefiniteIntegralEq(g_calc, Req(f, 0), Num(f, 1), NumOr(f, 2, 0.0), NumOr(f, 3, 1.0), 1000, 1e-7, VarOf(f, 4));
-                SetAns(v); return "x = " + Fmt(v);
-            }, {{"2x", "16", "0", "1", ""}}));
-        c.features.push_back(MkF("Two-Sided Equation  lhs = rhs", "Any equation; use ans for your last result.",
-            {TF("Equation", "e.g. x^2 + 2 = 3x"), TF("Initial guess", "1", "1")},
-            [](Feature& f) -> std::string {
+                Prepared p = PV(f, 0, 2);
                 g_calc.solver().setAns(g_ans);
-                double v = g_calc.solver().solveTwoSideEquation(g_calc, Req(f, 0), NumOr(f, 1, 1.0));
-                SetAns(v); return "x = " + Fmt(v);
-            }, {{"x^2+2=3x", "1"}, {"x + 2 = ans", "1"}}));
+                double v = g_calc.solver().solveGeneralEquation(g_calc, p.sub, NumOr(f, 1, 1.0), 1000, 1e-7, p.var);
+                SetAns(v); return std::string(1, p.var) + " = " + Fmt(v);
+            }, {{"cos(x)-x", "1", ""}, {"t^3-2t-5", "2", ""}}));
+        c.features.push_back(MkF("Derivative Equation  f'(x) = target", "Find the variable where f' equals a value (target 0 = critical point).",
+            {TF("f(x)", "e.g. x^3 - 3x"), TF("Target value", "0", "0"), TF("Initial guess", "1", "1"), TF("Variable", VH)},
+            [](Feature& f) -> std::string {
+                Prepared p = PV(f, 0, 3);
+                double v = g_calc.solver().solveDerivativeEq(g_calc, p.sub, NumOr(f, 1, 0.0), NumOr(f, 2, 1.0), 1000, 1e-7, p.var);
+                SetAns(v); return std::string(1, p.var) + " = " + Fmt(v);
+            }, {{"x^3-3x", "0", "2", ""}, {"t^3-3t", "0", "2", ""}}));
+        c.features.push_back(MkF("Integral Bound  Integral[a..b] f dx = target", "Find the upper bound b.",
+            {TF("f(x)", "e.g. 2x"), TF("a  (lower bound)", "0", "0"), TF("Target value", "e.g. 9"), TF("Initial guess", "1", "1"), TF("Variable", VH)},
+            [](Feature& f) -> std::string {
+                Prepared p = PV(f, 0, 4);
+                double v = g_calc.solver().solveIntegralBound(g_calc, p.sub, NumOr(f, 1, 0.0), Num(f, 2), NumOr(f, 3, 1.0), 1000, 1e-7, p.var);
+                SetAns(v); return "b = " + Fmt(v);
+            }, {{"2x", "0", "9", "1", ""}, {"2t", "0", "9", "1", "t"}}));
+        c.features.push_back(MkF("Limit Equation  lim x->a f(x) = target", "Find a such that the limit equals target.",
+            {TF("f(x)", "e.g. x^2"), TF("Target value", "e.g. 9"), TF("Initial guess", "1", "1"), TF("Variable", VH)},
+            [](Feature& f) -> std::string {
+                Prepared p = PV(f, 0, 3);
+                double v = g_calc.solver().solveLimitEq(g_calc, p.sub, Num(f, 1), NumOr(f, 2, 1.0), 1000, 1e-7, p.var);
+                SetAns(v); return "a = " + Fmt(v);
+            }, {{"x^2", "9", "2", ""}, {"t^2", "9", "2", ""}}));
+        c.features.push_back(MkF("Indefinite Integral Equation  F(x) = target", "Find the variable where F (integral from x_ref) equals target.",
+            {TF("f(x)", "e.g. 2x"), TF("Target value", "e.g. 16"), TF("x_ref (default 0)", "0", "0"), TF("Initial guess", "1", "1"), TF("Variable", VH)},
+            [](Feature& f) -> std::string {
+                Prepared p = PV(f, 0, 4);
+                double v = g_calc.solver().solveIndefiniteIntegralEq(g_calc, p.sub, Num(f, 1), NumOr(f, 2, 0.0), NumOr(f, 3, 1.0), 1000, 1e-7, p.var);
+                SetAns(v); return std::string(1, p.var) + " = " + Fmt(v);
+            }, {{"2x", "16", "0", "1", ""}}));
+        c.features.push_back(MkF("Two-Sided Equation  lhs = rhs", "Any equation in one variable (a-z, A-Z). Use ans for your last result.",
+            {TF("Equation", "e.g. x^2 + 2 = 3x   or   t^2 = 9"), TF("Initial guess", "1", "1"), TF("Variable", VH)},
+            [](Feature& f) -> std::string {
+                Prepared p = PV(f, 0, 2);
+                g_calc.solver().setAns(g_ans);
+                double v = g_calc.solver().solveTwoSideEquation(g_calc, p.sub, NumOr(f, 1, 1.0), 1000, 1e-7, p.var);
+                SetAns(v); return std::string(1, p.var) + " = " + Fmt(v);
+            }, {{"x^2+2=3x", "1", ""}, {"x + 2 = ans", "1", ""}, {"t^2 = 9", "1", "t"}}));
         {
             Feature f = MkF("Linear System  (any # of equations / variables)",
-                "One equation per box. Variables are detected automatically (x, y, z, ...). Use [+ Add] for more equations.",
+                "One equation per box. Variables are detected automatically (any letters a-z, A-Z). Use [+ Add Equation] for more.",
                 {TF("Equation 1", "e.g. 2x + 3y = 8"), TF("Equation 2", "e.g. x - y = 1")},
                 [](Feature& f) -> std::string {
                     std::vector<std::string> eqs;
-                    for (auto& fd : f.fields) { std::string s = ReplaceAns(Trim(fd.value)); if (!s.empty()) eqs.push_back(s); }
+                    for (auto& fd : f.fields) { std::string s = ApplyParams(ReplaceAns(Trim(fd.value))); if (!s.empty()) eqs.push_back(s); }
                     if (eqs.empty()) throw std::runtime_error("Please enter at least one equation");
                     auto sol = g_calc.solver().solveLinearSystem(g_calc, eqs);
                     std::string t = std::to_string(eqs.size()) + " equation(s), " + std::to_string(sol.size()) + " variable(s):\n";
                     for (auto& kv : sol) t += "  " + std::string(1, kv.first) + " = " + Fmt(kv.second) + "\n";
                     if (!sol.empty()) SetAns(sol.begin()->second);
                     return t;
-                }, {{"2x+3y=8", "x-y=1"}, {"x+y+z=6", "2x-y+z=3", "x+2y-z=2"}});
+                }, {{"2x+3y=8", "x-y=1"}, {"x+y+z=6", "2x-y+z=3", "x+2y-z=2"}, {"2a+3b=8", "a-b=1"}});
             f.dynLabel = "Equation"; f.dynStart = 0; f.dynMin = 1; f.dynMax = 10;
             c.features.push_back(f);
         }
         {
             Feature f = MkF("Nonlinear System  (any # of equations / variables)",
-                "Newton / Gauss-Newton. Optionally give initial guesses like  x=1, y=2.",
+                "Newton / Gauss-Newton. Optionally give initial guesses like  x=1, y=2  (any letters).",
                 {TF("Initial guess (optional)", "x=1, y=2"), TF("Equation 1", "e.g. x^2 + y^2 = 25"), TF("Equation 2", "e.g. x - y = 1")},
                 [](Feature& f) -> std::string {
                     std::vector<std::string> eqs;
-                    for (size_t i = 1; i < f.fields.size(); ++i) { std::string s = ReplaceAns(Trim(f.fields[i].value)); if (!s.empty()) eqs.push_back(s); }
+                    for (size_t i = 1; i < f.fields.size(); ++i) { std::string s = ApplyParams(ReplaceAns(Trim(f.fields[i].value))); if (!s.empty()) eqs.push_back(s); }
                     if (eqs.empty()) throw std::runtime_error("Please enter at least one equation");
                     std::map<char, double> guess;
                     if (!Opt(f, 0).empty()) guess = ParseGuess(Opt(f, 0));
@@ -888,7 +997,7 @@ static void BuildCatalog() {
                     t += "(Different initial guesses may reveal other solutions.)";
                     if (!sol.empty()) SetAns(sol.begin()->second);
                     return t;
-                }, {{"x=3,y=3", "x^2+y^2=25", "x-y=1"}});
+                }, {{"x=3,y=3", "x^2+y^2=25", "x-y=1"}, {"a=3,b=3", "a^2+b^2=25", "a-b=1"}});
             f.dynLabel = "Equation"; f.dynStart = 1; f.dynMin = 1; f.dynMax = 10;
             c.features.push_back(f);
         }
@@ -896,12 +1005,13 @@ static void BuildCatalog() {
     }
     // ===================== [4] Graph =====================
     {
-        Category c{"2D Text Graph Plotter", "9 plot types: zoom, pan left/right/up/down, resolution", {}};
+        Category c{"2D Text Graph Plotter", "9 plot types, any variable a-z / A-Z, zoom, pan up/down/left/right", {}};
         auto G = [](Feature f) { f.isGraph = true; return f; };
-        c.features.push_back(G(MkF("Plot f(x)", "Plot a function. Use Zoom / Left / Right / Up / Down buttons to move the view.",
-            {TF("f(x)", "e.g. sin(x)  or  x^2 - 4")},
-            [](Feature& f) -> std::string { return GraphOut(g_gv, Spec(GK_FUNC, Norm(Req(f, 0)))); },
-            {{"sin(x)"}, {"x^2-4"}, {"x^3-3x"}})));
+        const char* VH = "x, t, a ... (blank = auto)";
+        c.features.push_back(G(MkF("Plot f(x)", "Plot a function of any variable letter. Use Zoom / Left / Right / Up / Down to move the view.",
+            {TF("f(x)", "e.g. sin(x)   x^2 - 4   or   a*sin(t) (a in Vars)"), TF("Variable", VH)},
+            [](Feature& f) -> std::string { return GraphOut(g_gv, SpecV(GK_FUNC, PV(f, 0, 1))); },
+            {{"sin(x)", ""}, {"x^2-4", ""}, {"x^3-3x", ""}, {"sin(t)/t", ""}})));
         c.features.push_back(G(MkF("Plot Polynomial with Roots", "Coefficients from the highest power down. Roots are listed below the graph.",
             {TF("Coefficients", "1 -3 2")},
             [](Feature& f) -> std::string {
@@ -920,31 +1030,34 @@ static void BuildCatalog() {
                 for (auto& z : roots) out += "   " + FmtComplex(z);
                 return out;
             }, {{"1 -3 2"}, {"1 0 -4"}, {"1 0 1"}})));
-        c.features.push_back(G(MkF("Plot Derivative & Tangent at x0", "Graph of f with its tangent line at x0.",
-            {TF("f(x)", "e.g. x^2"), TF("x0", "e.g. 1")},
-            [](Feature& f) -> std::string { return GraphOut(g_gv, Spec(GK_DERIV, Norm(Req(f, 0)), Num(f, 1))); },
-            {{"x^2", "1"}})));
+        c.features.push_back(G(MkF("Plot Derivative & Tangent at x0", "Graph of f with its tangent line at the point x0.",
+            {TF("f(x)", "e.g. x^2   or   t^2"), TF("x0", "e.g. 1"), TF("Variable", VH)},
+            [](Feature& f) -> std::string { return GraphOut(g_gv, SpecV(GK_DERIV, PV(f, 0, 2), Num(f, 1))); },
+            {{"x^2", "1", ""}, {"t^3", "1", ""}})));
         c.features.push_back(G(MkF("Plot Integral Area over [a, b]", "Shaded area under f.",
-            {TF("f(x)", "e.g. x^2"), TF("a", "e.g. 0"), TF("b", "e.g. 2")},
-            [](Feature& f) -> std::string { return GraphOut(g_gv, Spec(GK_INTEG, Norm(Req(f, 0)), Num(f, 1), Num(f, 2))); },
-            {{"x^2", "0", "2"}})));
+            {TF("f(x)", "e.g. x^2"), TF("a", "e.g. 0"), TF("b", "e.g. 2"), TF("Variable", VH)},
+            [](Feature& f) -> std::string { return GraphOut(g_gv, SpecV(GK_INTEG, PV(f, 0, 3), Num(f, 1), Num(f, 2))); },
+            {{"x^2", "0", "2", ""}, {"s^2", "0", "2", ""}})));
         c.features.push_back(G(MkF("Plot Limit  x -> a", "Show f approaching a.",
-            {TF("f(x)", "e.g. sin(x)/x"), TF("a", "e.g. 0")},
-            [](Feature& f) -> std::string { return GraphOut(g_gv, Spec(GK_LIMIT, Norm(Req(f, 0)), Num(f, 1))); },
-            {{"sin(x)/x", "0"}})));
+            {TF("f(x)", "e.g. sin(x)/x"), TF("a", "e.g. 0"), TF("Variable", VH)},
+            [](Feature& f) -> std::string { return GraphOut(g_gv, SpecV(GK_LIMIT, PV(f, 0, 2), Num(f, 1))); },
+            {{"sin(x)/x", "0", ""}, {"sin(t)/t", "0", ""}})));
         c.features.push_back(G(MkF("Plot Indefinite Integral F(x)", "Graph of F(x) = integral of f from x_ref.",
-            {TF("f(x)", "e.g. cos(x)"), TF("x_ref (default 0)", "0", "0")},
-            [](Feature& f) -> std::string { return GraphOut(g_gv, Spec(GK_INDEF, Norm(Req(f, 0)), NumOr(f, 1, 0.0))); },
-            {{"cos(x)", "0"}})));
+            {TF("f(x)", "e.g. cos(x)"), TF("x_ref (default 0)", "0", "0"), TF("Variable", VH)},
+            [](Feature& f) -> std::string { return GraphOut(g_gv, SpecV(GK_INDEF, PV(f, 0, 2), NumOr(f, 1, 0.0))); },
+            {{"cos(x)", "0", ""}, {"cos(t)", "0", ""}})));
         c.features.push_back(MkLab("Plot Scatter Plot from DataTable", "Enter a data table and plot two columns.", FK_TABLE, 6));
-        c.features.push_back(G(MkF("Plot Area Between Two Curves", "Shaded area between f1 and f2 on [a, b].",
-            {TF("f1(x)", "e.g. x"), TF("f2(x)", "e.g. x^2"), TF("a", "e.g. 0"), TF("b", "e.g. 1")},
-            [](Feature& f) -> std::string { return GraphOut(g_gv, Spec(GK_AREA2, Norm(Req(f, 0)), Num(f, 2), Num(f, 3), Norm(Req(f, 1)))); },
-            {{"x", "x^2", "0", "1"}})));
+        c.features.push_back(G(MkF("Plot Area Between Two Curves", "Shaded area between f1 and f2 on [a, b] (same variable for both).",
+            {TF("f1(x)", "e.g. x"), TF("f2(x)", "e.g. x^2"), TF("a", "e.g. 0"), TF("b", "e.g. 1"), TF("Variable", VH)},
+            [](Feature& f) -> std::string {
+                Prepared p1 = PV(f, 0, 4), p2 = PV(f, 1, 4);
+                if (p1.var != p2.var && VarOf(f, 4) == '\0') p2 = PrepVar(Req(f, 1), p1.var);
+                return GraphOut(g_gv, SpecV(GK_AREA2, p1, Num(f, 2), Num(f, 3), &p2));
+            }, {{"x", "x^2", "0", "1", ""}, {"t", "t^2", "0", "1", ""}})));
         c.features.push_back(G(MkF("Plot Inverse Function f^-1(x)", "f, its inverse (reflection) and y = x.",
-            {TF("f(x)", "e.g. 2x + 1  or  x^3")},
-            [](Feature& f) -> std::string { return GraphOut(g_gv, Spec(GK_INVERSE, Norm(Req(f, 0)))); },
-            {{"2x+1"}, {"x^3"}})));
+            {TF("f(x)", "e.g. 2x + 1  or  x^3"), TF("Variable", VH)},
+            [](Feature& f) -> std::string { return GraphOut(g_gv, SpecV(GK_INVERSE, PV(f, 0, 1))); },
+            {{"2x+1", ""}, {"x^3", ""}, {"2t+1", ""}})));
         g_cats.push_back(c);
     }
     // ===================== [5] Matrix =====================
@@ -1033,7 +1146,7 @@ static void BuildCatalog() {
             {TF("A", "e.g. 1, 2, 3, 4"), TF("B", "e.g. 1, 2, 3, 4, 5, 6, 7"), TF("Condition", "e.g. y = 2x + 1   or   x < y")},
             [](Feature& f) -> std::string {
                 auto A = ParseSet(Req(f, 0)), B = ParseSet(Req(f, 1));
-                std::string cond = Req(f, 2);
+                std::string cond = ApplyParamsKeep(Req(f, 2), "xy");
                 auto r = g_fs.relationFromCondition(A, B, cond);
                 std::string t = "r = " + FunctionSolver::toString(r) + "\n";
                 t += "Domain  = " + FunctionSolver::toString(FunctionSolver::domainOf(r)) + "\n";
@@ -1047,7 +1160,7 @@ static void BuildCatalog() {
         c.features.push_back(MkF("Analyze Relation Equation", "Vertical line test, domain, range, solved form.",
             {TF("Equation", "e.g. x^2 + y^2 = 25   or   y = 1/(x+1)")},
             [](Feature& f) -> std::string {
-                RelationReport r = g_fs.analyzeRelation(Req(f, 0));
+                RelationReport r = g_fs.analyzeRelation(ApplyParamsKeep(Req(f, 0), "xy"));
                 std::string t = std::string("Function (vertical line test): ") + (r.isFunction ? "yes" : "no");
                 if (!r.isFunction) t += "\n  e.g. x = " + Fmt(r.counterExampleX) + " gives y in " + FunctionSolver::toString(r.counterExampleY);
                 t += "\nStandard form: " + r.standardForm;
@@ -1057,10 +1170,10 @@ static void BuildCatalog() {
                 t += "\nRange  = " + FunctionSolver::toString(r.range);
                 return t;
             }, {{"x^2+y^2=25"}, {"y=1/(x+1)"}, {"y^2=x"}}));
-        c.features.push_back(MkF("Analyze Function f(x)", "Domain, range, increasing/decreasing, one-to-one.",
-            {TF("f(x)", "e.g. sqrt(x-2)   or   1/(x+1)")},
-            [](Feature& f) -> std::string { return g_fs.describeFunction(Req(f, 0)); },
-            {{"sqrt(x-2)"}, {"1/(x+1)"}, {"x^2"}}));
+        c.features.push_back(MkF("Analyze Function f(x)", "Domain, range, increasing/decreasing, one-to-one. Any variable letter a-z / A-Z.",
+            {TF("f(x)", "e.g. sqrt(x-2)   1/(x+1)   or   sqrt(t-2)"), TF("Variable (blank = auto)", "x, t, a ...")},
+            [](Feature& f) -> std::string { Prepared p = PV(f, 0, 1); return g_fs.describeFunction(p.sub, p.var); },
+            {{"sqrt(x-2)", ""}, {"1/(x+1)", ""}, {"x^2", ""}, {"sqrt(t-2)", ""}}));
         {
             Feature f = MkF("Algebra of Functions  (N functions)",
                 "Combine any number of functions with one operation, left to right. Use [+ Add Function] for more.",
@@ -1068,7 +1181,7 @@ static void BuildCatalog() {
                  TF("Function 1", "e.g. x^2"), TF("Function 2", "e.g. x - 1")},
                 [](Feature& f) -> std::string {
                     std::vector<std::string> fs;
-                    for (size_t i = 1; i < f.fields.size(); ++i) { std::string s = ReplaceAns(Trim(f.fields[i].value)); if (!s.empty()) fs.push_back(s); }
+                    for (size_t i = 1; i < f.fields.size(); ++i) { std::string s = ReplaceAns(Trim(f.fields[i].value)); if (!s.empty()) fs.push_back(PrepVar(s).sub); }
                     if (fs.size() < 2) throw std::runtime_error("Please enter at least 2 functions");
                     int op = Pick(f, 0);
                     const char* sym[] = {" + ", " - ", " * ", " / "};
@@ -1094,7 +1207,7 @@ static void BuildCatalog() {
                  TF("Function 1", "e.g. 2x + 1"), TF("Function 2", "e.g. x^2")},
                 [](Feature& f) -> std::string {
                     std::vector<std::string> fs;
-                    for (size_t i = 1; i < f.fields.size(); ++i) { std::string s = ReplaceAns(Trim(f.fields[i].value)); if (!s.empty()) fs.push_back(s); }
+                    for (size_t i = 1; i < f.fields.size(); ++i) { std::string s = ReplaceAns(Trim(f.fields[i].value)); if (!s.empty()) fs.push_back(PrepVar(s).sub); }
                     if (fs.size() < 2) throw std::runtime_error("Please enter at least 2 functions");
                     int n = (int)fs.size();
                     auto build = [&](bool firstApplied, std::string& steps) -> std::string {
@@ -1130,34 +1243,36 @@ static void BuildCatalog() {
             f.dynLabel = "Function"; f.dynStart = 1; f.dynMin = 2; f.dynMax = 8;
             c.features.push_back(f);
         }
-        c.features.push_back(MkF("Inverse Function  f^-1", "Formula (linear f) and numeric f^-1(y0).",
-            {TF("f(x)", "e.g. 3x - 6"), TF("y0  (optional, find f^-1(y0))", "e.g. 9")},
+        c.features.push_back(MkF("Inverse Function  f^-1", "Formula (linear f) and numeric f^-1(y0). Any variable letter a-z / A-Z.",
+            {TF("f(x)", "e.g. 3x - 6   or   3t - 6"), TF("y0  (optional, find f^-1(y0))", "e.g. 9"), TF("Variable (blank = auto)", "x, t, a ...")},
             [](Feature& f) -> std::string {
-                std::string e = Req(f, 0);
-                std::string t = std::string("f is one-to-one: ") + (g_fs.isOneToOne(e) ? "yes" : "NO (no inverse function)") + "\n";
-                std::string inv = g_fs.inverseExpression(e);
+                Prepared p = PV(f, 0, 2);
+                const std::string& e = p.sub; char v = p.var;
+                std::string t = std::string("f is one-to-one: ") + (g_fs.isOneToOne(e, v) ? "yes" : "NO (no inverse function)") + "\n";
+                std::string inv = g_fs.inverseExpression(e, v);
                 t += inv.empty() ? "f is not linear: no closed formula, use f^-1(y0) below.\n" : "f^-1(x) = " + inv + "\n";
-                if (!Opt(f, 1).empty()) { double y0 = Num(f, 1); double v = g_fs.inverseAt(e, y0); SetAns(v); t += "f^-1(" + Fmt(y0) + ") = " + Fmt(v); }
+                if (!Opt(f, 1).empty()) { double y0 = Num(f, 1); double r = g_fs.inverseAt(e, y0, v); SetAns(r); t += "f^-1(" + Fmt(y0) + ") = " + Fmt(r); }
                 return t;
-            }, {{"3x-6", "9"}, {"x^3", "8"}}));
+            }, {{"3x-6", "9", ""}, {"x^3", "8", ""}, {"3t-6", "9", ""}}));
         c.features.push_back(MkF("Function Type on A -> B  (Function / Onto / 1-1)", "Check a relation or f(x) between two sets / intervals.",
             {CF("Mode", {"Finite sets + relation condition", "f(x) on real intervals"}),
-             TF("A", "e.g. 1,2,3   or   [0,inf)"), TF("B", "e.g. 3,5,7   or   [0,inf)"), TF("Condition  /  f(x)", "e.g. y=2x+1   or   x^2")},
+             TF("A", "e.g. 1,2,3   or   [0,inf)"), TF("B", "e.g. 3,5,7   or   [0,inf)"), TF("Condition  /  f(x)", "e.g. y=2x+1   or   x^2"),
+             TF("Variable (intervals mode)", "x, t, a ... (blank = auto)")},
             [](Feature& f) -> std::string {
                 if (Pick(f, 0) == 0) {
                     auto A = ParseSet(Req(f, 1)), B = ParseSet(Req(f, 2));
-                    auto r = g_fs.relationFromCondition(A, B, Req(f, 3));
+                    auto r = g_fs.relationFromCondition(A, B, ApplyParamsKeep(Req(f, 3), "xy"));
                     return "r = " + FunctionSolver::toString(r) +
                            std::string("\nFunction A -> B: ") + (FunctionSolver::isFunctionFromAToB(r, A, B) ? "yes" : "no") +
                            "\nOnto B:          " + (FunctionSolver::isOntoB(r, B) ? "yes" : "no") +
                            "\nOne-to-one:      " + (FunctionSolver::isOneToOne(r) ? "yes" : "no");
                 }
                 Interval A = ParseInterval(Req(f, 1)), B = ParseInterval(Req(f, 2));
-                std::string e = Req(f, 3);
-                return std::string("f: A -> B is a function: ") + (g_fs.isFunctionFromTo(e, A, B) ? "yes" : "no") +
-                       "\nOnto B:     " + (g_fs.isOnto(e, A, B) ? "yes" : "no") +
-                       "\nOne-to-one: " + (g_fs.isOneToOneOn(e, A) ? "yes" : "no");
-            }, {{"0", "1,2,3", "3,5,7,9", "y=2x+1"}, {"1", "[0,inf)", "[0,inf)", "x^2"}}));
+                Prepared p = PV(f, 3, 4);
+                return std::string("f: A -> B is a function: ") + (g_fs.isFunctionFromTo(p.sub, A, B, p.var) ? "yes" : "no") +
+                       "\nOnto B:     " + (g_fs.isOnto(p.sub, A, B, p.var) ? "yes" : "no") +
+                       "\nOne-to-one: " + (g_fs.isOneToOneOn(p.sub, A, p.var) ? "yes" : "no");
+            }, {{"0", "1,2,3", "3,5,7,9", "y=2x+1", ""}, {"1", "[0,inf)", "[0,inf)", "x^2", ""}, {"1", "[0,inf)", "[0,inf)", "t^2", "t"}}));
         {
             Feature f = MkF("Function Notation  f(x+h), f(a+1), ...", "Define functions, then expand an expression or solve an equation using them.",
                 {CF("Mode", {"Expand / evaluate expression", "Solve equation"}),
@@ -1168,8 +1283,8 @@ static void BuildCatalog() {
                     std::vector<std::string> defs;
                     for (size_t i = 3; i < f.fields.size(); ++i) { std::string s = Trim(f.fields[i].value); if (!s.empty()) defs.push_back(s); }
                     if (defs.empty()) throw std::runtime_error("Please enter at least one definition");
-                    std::map<char, double> vals;
-                    if (!Opt(f, 2).empty()) vals = ParseGuess(Opt(f, 2));
+                    std::map<char, double> vals = ParamMap();                      // ค่าจากช่อง Vars + ค่าในฟอร์ม
+                    if (!Opt(f, 2).empty()) for (auto& kv : ParseGuess(Opt(f, 2))) vals[kv.first] = kv.second;
                     std::string q = Req(f, 1);
                     if (Pick(f, 0) == 0) {
                         CallResult r = g_fs.evaluateCall(defs, q, vals);
@@ -1238,8 +1353,12 @@ static void TopBar(const std::string& title) {
     FillRectPx(0, 0, g_w, 46, RGB32(24, 26, 32));
     if (DrawButton(10, 8, 70, 30, "Home", COL_CHIP)) GoHome();
     if (DrawButton(86, 8, 84, 30, "< Back", COL_CHIP)) GoBack();
-    DrawText_(184, 23 - FontH(g_fontL) / 2, FitHead(g_fontL, title, g_w - 184 - 190), COL_TEXT, g_fontL);
-    DrawTextRight(g_w - 12, 23 - FontH(g_fontS) / 2, FitHead(g_fontS, "ans = " + Fmt(g_ans), 180), COL_GREEN, g_fontS);
+    const int ansW = 170, varW = 260;
+    DrawText_(184, 23 - FontH(g_fontL) / 2, FitHead(g_fontL, title, g_w - 184 - ansW - varW - 64), COL_TEXT, g_fontL);
+    DrawTextRight(g_w - 12, 23 - FontH(g_fontS) / 2, FitHead(g_fontS, "ans = " + Fmt(g_ans), ansW - 8), COL_GREEN, g_fontS);
+    int vx = g_w - 12 - ansW - varW;
+    DrawText_(vx - 40, 23 - FontH(g_fontM) / 2, "Vars", COL_DIM, g_fontM);
+    TextBox(vx, 8, varW, 30, g_paramStr, "a=2, b=3  (any letters a-z A-Z)", g_fontM);
 }
 static bool ClickArea(int x, int y, int w, int h) {
     int id = NextId();
@@ -1332,15 +1451,25 @@ static void CalcEquals() {
     g_cErr.clear();
     try {
         g_calc.solver().setAns(g_ans);
+        size_t as = e.find(":=");
+        if (as != std::string::npos) {                        // กำหนดค่าตัวแปร a-z / A-Z:   a := 5
+            std::string name = Trim(e.substr(0, as));
+            if (name.size() != 1 || !isalpha((unsigned char)name[0]) || name[0] == 'e')
+                throw std::runtime_error("Assign like   a := 5   (one letter a-z / A-Z, not e)");
+            double v = EvalNum(e.substr(as + 2));
+            SetParam(name[0], v);
+            g_cResult = name + " = " + Fmt(v); g_cFresh = true;
+            g_hist.push_back({e, g_cResult}); g_histScroll = 0;
+            return;
+        }
         std::string full = ReplaceAns(e), res;
         double v;
-        if (full.find('=') != std::string::npos) {
-            char var = 'x';
-            try { var = AlphaSolverEq::detectVariable(full); } catch (...) {}
-            v = g_calc.solver().solveTwoSideEquation(g_calc, full);
-            res = std::string(1, var) + " = " + Fmt(v);
+        if (full.find('=') != std::string::npos) {            // สมการ: ตัวแปรใดก็ได้ (a-z, A-Z)
+            Prepared p = PrepVar(full);
+            v = g_calc.solver().solveTwoSideEquation(g_calc, p.sub, 1.0, 1000, 1e-7, p.var);
+            res = std::string(1, p.var) + " = " + Fmt(v);
         } else {
-            v = g_calc.evaluate(full);
+            v = EvalNum(e);
             res = Fmt(v);
         }
         SetAns(v);
@@ -1357,7 +1486,7 @@ static const CKey CALC_KEYS[45] = {
     {"sin","sin(",0,COL_BTN},{"cos","cos(",0,COL_BTN},{"tan","tan(",0,COL_BTN},{"^","^",0,COL_OP},{"sqrt","sqrt(",0,COL_BTN},
     {"asin","asin(",0,COL_BTN},{"acos","acos(",0,COL_BTN},{"atan","atan(",0,COL_BTN},{"ln","ln(",0,COL_BTN},{"log","log(",0,COL_BTN},
     {"exp","exp(",0,COL_BTN},{"abs","abs(",0,COL_BTN},{"fact","fact(",0,COL_BTN},{"pi","pi",0,COL_BTN},{"e","e",0,COL_BTN},
-    {"root","root(",0,COL_BTN},{"inf","inf",0,COL_BTN},{"x^2","^2",0,COL_OP},{"1/x","1/(",0,COL_OP},{"->x","",4,COL_BTN},
+    {"root","root(",0,COL_BTN},{"inf","inf",0,COL_BTN},{"x^2","^2",0,COL_OP},{"1/x","1/(",0,COL_OP},{":=",":=",0,COL_OP},
     {"7","7",0,COL_NUM},{"8","8",0,COL_NUM},{"9","9",0,COL_NUM},{"/","/",0,COL_OP},{"x","x",0,COL_BTN},
     {"4","4",0,COL_NUM},{"5","5",0,COL_NUM},{"6","6",0,COL_NUM},{"*","*",0,COL_OP},{"%","%",0,COL_OP},
     {"1","1",0,COL_NUM},{"2","2",0,COL_NUM},{"3","3",0,COL_NUM},{"-","-",0,COL_OP},{",",",",0,COL_OP},
@@ -1453,7 +1582,7 @@ static const FKey FORM_KEYS[42] = {
     {"0","0",COL_NUM},{".",".",COL_NUM},{"=","=",COL_OP},{"+","+",COL_OP},{"pi","pi",COL_BTN},{"e","e",COL_BTN},
     {"sin","sin(",COL_BTN},{"cos","cos(",COL_BTN},{"tan","tan(",COL_BTN},{"ln","ln(",COL_BTN},{"log","log(",COL_BTN},{"exp","exp(",COL_BTN},
     {"asin","asin(",COL_BTN},{"acos","acos(",COL_BTN},{"atan","atan(",COL_BTN},{"sqrt","sqrt(",COL_BTN},{"abs","abs(",COL_BTN},{"fact","fact(",COL_BTN},
-    {"ans","ans",COL_BTN},{"inf","inf",COL_BTN},{"DEL","<DEL>",COL_CLEAR},{"CLR","<CLR>",COL_CLEAR},{";",";",COL_OP},{"space"," ",COL_OP},
+    {"ans","ans",COL_BTN},{"inf","inf",COL_BTN},{"DEL","<DEL>",COL_CLEAR},{"CLR","<CLR>",COL_CLEAR},{"t","t",COL_BTN},{"a","a",COL_BTN},
 };
 static void MathKeypad(int x, int bottom, int w) {
     int cols = 6, rows = 7, gap = 4, kh = 28;
@@ -1955,6 +2084,7 @@ static std::string TableRun() {
                 if (!ch) break;
                 used += ch; map.push_back(ch);
             }
+            e = ApplyParamsKeep(e, used);                       // พารามิเตอร์อื่น ๆ ใน Vars
             DataTable res = TableCalculate::applyExpression(t, g_calc, e, map, "result");
             std::string s = "Expression: " + e + "\nVariables: ";
             for (size_t c = 0; c < map.size(); ++c) s += std::string(1, map[c]) + "=" + G.hdr[c] + (c + 1 < map.size() ? ", " : "");
