@@ -1,12 +1,13 @@
 //          g++ -std=c++17 *.cpp -o calc -lX11      
-#include "../lib/algebra.hpp"
-#include "../lib/Alpha_solver_eq.hpp"
-#include "../lib/Calculator_calculus.hpp"
-#include "../lib/function_solver.hpp"
-#include "../lib/math_graph.hpp"
-#include "../lib/matrix.hpp"
-#include "../lib/menu.hpp"
-#include "../lib/table_calculate.hpp"
+#include "algebra.hpp"
+#include "Alpha_solver_eq.hpp"
+#include "Calculator_calculus.hpp"
+#include "function_solver.hpp"
+#include "math_graph.hpp"
+#include "math_logic.hpp"
+#include "matrix.hpp"
+#include "menu.hpp"
+#include "table_calculate.hpp"
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -180,6 +181,7 @@ static void Defer(std::function<void()> fn) { g_deferred.push_back(std::move(fn)
 // ============================================================
 static Calculator g_calc;
 static FunctionSolver g_fs(g_calc);
+static MathLogic g_logic(&g_calc);
 static double g_ans = 0.0;
 
 static void SetAns(double v) { g_ans = v; g_calc.solver().setAns(v); }
@@ -525,6 +527,8 @@ struct Feature {
     RunFn run;
     std::function<void(Feature&)> refresh;            // ปรับป้ายชื่อช่องตามตัวเลือก
     bool isGraph = false;
+    bool noWrap = false;                              // ผลลัพธ์เป็นตาราง: ไม่ตัดบรรทัด แต่เลื่อนซ้าย-ขวาได้
+    int hscroll = 0;
     std::string dynLabel;                             // ไม่ว่าง = เพิ่ม/ลบช่องได้ (เช่น สมการที่ k)
     int dynStart = 0, dynMin = 1, dynMax = 8;
     std::string result, error;
@@ -556,6 +560,13 @@ static std::string Req(Feature& f, int i) {
     if (s.empty()) throw std::runtime_error("Please fill in: " + f.fields[i].label);
     return s;
 }
+// สูตรตรรกศาสตร์ (ใช้ข้อความดิบ ไม่แทรก * หรือแทนค่า ans)
+static std::string LReq(Feature& f, int i) {
+    std::string s = Trim(f.fields[i].value);
+    if (s.empty()) throw std::runtime_error("Please fill in: " + f.fields[i].label);
+    return s;
+}
+static std::string LOpt(Feature& f, int i) { return Trim(f.fields[i].value); }
 static double Num(Feature& f, int i) { return EvalNum(Req(f, i)); }
 static double NumOr(Feature& f, int i, double d) { return Opt(f, i).empty() ? d : EvalNum(Opt(f, i)); }
 static char VarOf(Feature& f, int i) { std::string s = Opt(f, i); return s.empty() ? '\0' : s[0]; }
@@ -1307,6 +1318,87 @@ static void BuildCatalog() {
         }
         g_cats.push_back(c);
     }
+    // ===================== [8] Mathematical Logic =====================
+    {
+        Category c{"Mathematical Logic", "Truth tables, tautology, equivalence, arguments, proofs, quantifiers", {}};
+        auto L = [](Feature f) { f.noWrap = true; return f; };
+        const char* FH = "e.g. (p -> q) & (q -> r)";
+        c.features.push_back(L(MkF("Truth Table", "Build the truth table of any formula (up to 16 variables). Connectives: ~ & | xor -> <-> nand nor.",
+            {TF("Formula", FH), CF("Columns", {"All sub-formulas", "Variables + result only"}), CF("Values", {"T / F", "1 / 0"})},
+            [](Feature& f) -> std::string {
+                std::string fm = LReq(f, 0);
+                auto t = g_logic.truthTable(fm, Pick(f, 1) == 0);
+                std::string head = "Formula: " + MathLogic::toString(g_logic.parse(fm)) + "\n" + std::to_string(t.vars.size()) + " variable(s), " +
+                                   std::to_string(t.values.size()) + " row(s)\n\n";
+                auto cl = g_logic.classify(fm);
+                std::string verdict = cl.kind == MathLogic::Verdict::Tautology ? "TAUTOLOGY (all rows true)"
+                                    : cl.kind == MathLogic::Verdict::Contradiction ? "CONTRADICTION (all rows false)" : "CONTINGENCY (some true, some false)";
+                return head + MathLogic::formatTruthTable(t, Pick(f, 2) == 0) + "\nResult: " + verdict;
+            }, {{"(p -> q) & (q -> r)", "0", "0"}, {"~(p & q) <-> (~p | ~q)", "0", "0"}, {"p xor q", "1", "1"}, {"(p | q) & ~(p & q)", "0", "0"}})));
+        c.features.push_back(L(MkF("Tautology / Contradiction / Contingency", "Classify a formula; shows a model, a counter-model, minterms and maxterms.",
+            {TF("Formula", "e.g. p | ~p   or   (p & q) -> p")},
+            [](Feature& f) -> std::string { return g_logic.classifyReport(LReq(f, 0)); },
+            {{"p | ~p"}, {"p & ~p"}, {"(p -> q) & (q -> r)"}, {"((p -> q) & (q -> r)) -> (p -> r)"}})));
+        c.features.push_back(L(MkF("Logical Equivalence & Implication", "Compare two formulas; names the law when one applies (De Morgan, contrapositive, ...).",
+            {TF("Formula A", "e.g. ~(p & q)"), TF("Formula B", "e.g. ~p | ~q")},
+            [](Feature& f) -> std::string { return g_logic.equivalenceReport(LReq(f, 0), LReq(f, 1)); },
+            {{"~(p & q)", "~p | ~q"}, {"p -> q", "~q -> ~p"}, {"p -> q", "q -> p"}, {"p <-> q", "(p -> q) & (q -> p)"}})));
+        {
+            Feature f = MkF("Argument Validity (premises => conclusion)",
+                "Checks validity by critical rows. Detects the rule (MP, MT, HS, DS, ...) or a fallacy. Use [+ Add Premise] for more.",
+                {TF("Conclusion", "e.g. r"), TF("Premise 1", "e.g. p -> q"), TF("Premise 2", "e.g. q -> r")},
+                [](Feature& f) -> std::string {
+                    std::vector<std::string> prem;
+                    for (size_t i = 1; i < f.fields.size(); ++i) { std::string s = LOpt(f, (int)i); if (!s.empty()) prem.push_back(s); }
+                    return g_logic.argumentReport(prem, LReq(f, 0));
+                }, {{"q", "p -> q", "p"}, {"p", "p -> q", "q"}, {"~p", "p -> q", "~q"}, {"r", "p -> q", "q -> r", "p"}, {"q | s", "(p -> q) & (r -> s)", "p | r"}});
+            f.noWrap = true; f.dynLabel = "Premise"; f.dynStart = 1; f.dynMin = 1; f.dynMax = 8;
+            c.features.push_back(f);
+        }
+        {
+            Feature f = MkF("Proof by Inference Rules (natural deduction)",
+                "Derives the goal from the premises with MP, MT, HS, DS, Simplification, Conjunction, Addition, Resolution and conditional proof.",
+                {TF("Goal", "e.g. r"), TF("Premise 1", "e.g. p -> q"), TF("Premise 2", "e.g. q -> r"), TF("Premise 3", "e.g. p")},
+                [](Feature& f) -> std::string {
+                    std::vector<std::string> prem;
+                    for (size_t i = 1; i < f.fields.size(); ++i) { std::string s = LOpt(f, (int)i); if (!s.empty()) prem.push_back(s); }
+                    return g_logic.proveReport(prem, LReq(f, 0));
+                }, {{"r", "p -> q", "q -> r", "p"}, {"p -> r", "p -> q", "q -> r"}, {"r & q", "p | q", "~p", "q -> r"}, {"~q -> ~p", "p -> q"}});
+            f.noWrap = true; f.dynLabel = "Premise"; f.dynStart = 1; f.dynMin = 1; f.dynMax = 8;
+            c.features.push_back(f);
+        }
+        c.features.push_back(L(MkF("Normal Forms & Simplification (Boolean algebra)", "NNF, canonical DNF/CNF (minterms/maxterms) and minimal DNF/CNF by Quine-McCluskey.",
+            {TF("Formula", "e.g. (p -> q) & (q -> r)")},
+            [](Feature& f) -> std::string { return g_logic.normalFormsReport(LReq(f, 0)); },
+            {{"(p -> q) & (q -> r)"}, {"p xor q"}, {"(p & q) | (p & ~q) | (~p & q)"}, {"p <-> q"}})));
+        c.features.push_back(L(MkF("Conditional: Converse, Inverse, Contrapositive", "Enter p -> q to get its related conditionals and which ones are equivalent.",
+            {TF("Conditional  p -> q", "e.g. rain -> wet")},
+            [](Feature& f) -> std::string { return g_logic.conditionalReport(LReq(f, 0)); },
+            {{"p -> q"}, {"rain -> wet"}, {"(a & b) -> c"}})));
+        c.features.push_back(L(MkF("Evaluate with Truth Values (step by step)", "Give p=T, q=F, ... and see each sub-formula evaluated.",
+            {TF("Formula", FH), TF("Truth values", "p=T, q=F, r=T")},
+            [](Feature& f) -> std::string { return g_logic.stepsReport(LReq(f, 0), MathLogic::parseAssignment(LReq(f, 1))); },
+            {{"(p -> q) & ~r", "p=T, q=F, r=T"}, {"(p | q) -> (p & q)", "p=T, q=F"}})));
+        c.features.push_back(L(MkF("Quantifiers over a Finite Universe (forall / exists)", "Open sentences with comparisons. Universe: {1,2,3} or 1..10 (or 0..1 step 0.5). Shows witness / counterexample and the negation.",
+            {TF("Statement", "e.g. forall x in {1,2,3}: x^2 > 1"), TF("Truth values (optional)", "p=T, q=F")},
+            [](Feature& f) -> std::string {
+                std::map<std::string, bool> a;
+                if (!LOpt(f, 1).empty()) a = MathLogic::parseAssignment(LOpt(f, 1));
+                return g_logic.quantifierReport(LReq(f, 0), a);
+            }, {{"forall x in {1,2,3}: x^2 > 1", ""}, {"exists x in 1..10: x^2 = 49", ""}, {"forall x in 1..5: exists y in 1..5: x + y = 6", ""},
+                {"forall x in {2,4,6}: x > 1 & x < 7", ""}, {"~(exists x in {1,2,3}: x > 5)", ""}})));
+        c.features.push_back(L(MkF("Reference: connectives, laws, rules, overview", "Truth rules of the connectives, equivalence laws, rules of inference & fallacies, and an overview of mathematical logic.",
+            {CF("Topic", {"Connectives & truth rules", "Equivalence laws", "Rules of inference & fallacies", "Overview: mathematical logic"})},
+            [](Feature& f) -> std::string {
+                switch (Pick(f, 0)) {
+                    case 0: return MathLogic::connectivesText();
+                    case 1: return MathLogic::lawsText();
+                    case 2: return MathLogic::rulesText();
+                    default: return MathLogic::overviewText();
+                }
+            })));
+        g_cats.push_back(c);
+    }
 }
 
 // ============================================================
@@ -1372,10 +1464,11 @@ static bool ClickArea(int x, int y, int w, int h) {
 // ============================================================
 static void ScreenHome() {
     DrawTextCenter(g_w / 2, 34, "MATHS SOLVER SYSTEM", COL_TEXT, g_fontL);
-    DrawTextCenter(g_w / 2, 62, "Click a card (or press 1-7) to start", COL_DIM, g_fontS);
+    DrawTextCenter(g_w / 2, 62, "Click a card (or press 1-" + std::to_string(g_cats.size()) + ") to start", COL_DIM, g_fontS);
     int cols = 2, gap = 14, x0 = 20, y0 = 90;
     int cw = (g_w - 2 * x0 - gap) / cols;
-    int ch = std::clamp((g_h - y0 - 20 - 3 * gap) / 4, 70, 120);
+    int rowsN = ((int)g_cats.size() + 1 + cols - 1) / cols;
+    int ch = std::clamp((g_h - y0 - 20 - (rowsN - 1) * gap) / rowsN, 56, 120);
     for (size_t i = 0; i < g_cats.size(); ++i) {
         int cx = x0 + (int)(i % cols) * (cw + gap), cy = y0 + (int)(i / cols) * (ch + gap);
         bool over = Hit(cx, cy, cw, ch);
@@ -1584,13 +1677,22 @@ static const FKey FORM_KEYS[42] = {
     {"asin","asin(",COL_BTN},{"acos","acos(",COL_BTN},{"atan","atan(",COL_BTN},{"sqrt","sqrt(",COL_BTN},{"abs","abs(",COL_BTN},{"fact","fact(",COL_BTN},
     {"ans","ans",COL_BTN},{"inf","inf",COL_BTN},{"DEL","<DEL>",COL_CLEAR},{"CLR","<CLR>",COL_CLEAR},{"t","t",COL_BTN},{"a","a",COL_BTN},
 };
-static void MathKeypad(int x, int bottom, int w) {
+static const FKey LOGIC_KEYS[42] = {
+    {"p","p",COL_BTN},{"q","q",COL_BTN},{"r","r",COL_BTN},{"s","s",COL_BTN},{"t","t",COL_BTN},{"u","u",COL_BTN},
+    {"~","~",COL_OP},{"&","&",COL_OP},{"|","|",COL_OP},{"->","->",COL_OP},{"<->","<->",COL_OP},{"xor"," xor ",COL_OP},
+    {"(","(",COL_OP},{")",")",COL_OP},{"T","T",COL_NUM},{"F","F",COL_NUM},{"nand"," nand ",COL_OP},{"nor"," nor ",COL_OP},
+    {"forall","forall ",COL_BTN},{"exists","exists ",COL_BTN},{"in"," in ",COL_BTN},{":",": ",COL_BTN},{"{","{",COL_BTN},{"}","}",COL_BTN},
+    {"x","x",COL_BTN},{"y","y",COL_BTN},{"0","0",COL_NUM},{"1","1",COL_NUM},{"2","2",COL_NUM},{"3","3",COL_NUM},
+    {">",">",COL_NUM},{"<","<",COL_NUM},{">=",">=",COL_NUM},{"<=","<=",COL_NUM},{"=","=",COL_NUM},{"!=","!=",COL_NUM},
+    {",",",",COL_OP},{"..","..",COL_OP},{"DEL","<DEL>",COL_CLEAR},{"CLR","<CLR>",COL_CLEAR},{"space"," ",COL_OP},{"^","^",COL_OP},
+};
+static void MathKeypad(int x, int bottom, int w, const FKey* keys) {
     int cols = 6, rows = 7, gap = 4, kh = 28;
     int kw = (w - (cols - 1) * gap) / cols;
     int top = bottom - (rows * kh + (rows - 1) * gap);
     for (int r = 0; r < rows; ++r)
         for (int c = 0; c < cols; ++c) {
-            const FKey& k = FORM_KEYS[r * cols + c];
+            const FKey& k = keys[r * cols + c];
             if (DrawButton(x + c * (kw + gap), top + r * (kh + gap), kw, kh, k.l, k.col)) FieldInsert(k.ins);
         }
 }
@@ -1701,7 +1803,7 @@ static void ScreenForm() {
         Defer([&f] { for (auto& fd : f.fields) { if (fd.choices.empty()) fd.value.clear(); } f.result.clear(); f.error.clear(); ResetFocus(); });
     }
     y += 44;
-    MathKeypad(lx, g_h - 10, lw);
+    MathKeypad(lx, g_h - 10, lw, g_cats[g_cat].title == "Mathematical Logic" ? LOGIC_KEYS : FORM_KEYS);
 
     // ---- แผงขวา ----
     int rx = lx + lw + 12, rw = g_w - rx - 10, ry = 56;
@@ -1711,7 +1813,7 @@ static void ScreenForm() {
         ry += GraphControls(rx, ry, rw, g_gv, rerun, plotClicked);
         if (plotClicked) doRun = true;
     }
-    ResultPanel(rx, ry, rw, g_h - ry - 10, f.result, f.error, f.scroll, !f.isGraph);
+    ResultPanel(rx, ry, rw, g_h - ry - 10, f.result, f.error, f.scroll, !f.isGraph && !f.noWrap, f.noWrap ? &f.hscroll : nullptr);
     if (doRun) Defer([&f] { RunFeature(f); });
 }
 
