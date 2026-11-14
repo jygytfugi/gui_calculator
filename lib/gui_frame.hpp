@@ -1,13 +1,33 @@
-//          g++ -std=c++17 *.cpp -o calc -lX11      
-#include "algebra.hpp"
-#include "Alpha_solver_eq.hpp"
-#include "Calculator_calculus.hpp"
-#include "function_solver.hpp"
-#include "math_graph.hpp"
-#include "math_logic.hpp"
-#include "matrix.hpp"
-#include "menu.hpp"
-#include "table_calculate.hpp"
+// ============================================================================
+//  MATHS SOLVER SYSTEM  -  GUI เครื่องคิดเลขแบบมีปุ่มกด (Linux / X11)  [แก้เฉพาะ main.cpp]
+//
+//  ฟีเจอร์ครบเหมือนเวอร์ชัน terminal (menu.cpp) ทั้ง 7 หมวด:
+//   [1] Algebra Calculator  - คำนวณต่อเนื่อง + ans + ประวัติ (คลิกประวัติเพื่อเรียกกลับมาแก้)
+//   [2] Calculus Solver     - อนุพันธ์/ปริพันธ์/ลิมิต (ตัวเลข+สัญลักษณ์)
+//   [3] Alpha Equation      - พหุนาม, แยกตัวประกอบ, f(x)=0, สมการอนุพันธ์/อินทิกรัล/ลิมิต, lhs=rhs,
+//                             ระบบสมการเชิงเส้น/ไม่เชิงเส้น (กี่สมการ กี่ตัวแปรก็ได้)
+//   [4] 2D Graph Plotter    - 9 แบบ + ซูมเข้า/ออก/เลื่อน/ตั้งช่วง x/ความละเอียด
+//   [5] Multi-Matrix        - เมทริกซ์ N ตัว ขนาด n x m (สูงสุด 12 x 12) บวก/ลบ/คูณ N ตัว, transpose,
+//                             det, inverse, อนุพันธ์/ปริพันธ์ทีละสมาชิก, แก้ AX=B, เก็บผลลัพธ์เป็นเมทริกซ์ใหม่
+//   [6] Table & Probability - ตารางข้อมูล+สถิติ, binomial/poisson/Z table, ตัวคำนวณการแจกแจง, nCr/nPr, joint table
+//   [7] Relations/Functions - Cartesian N เซต, relation, domain/range, 1-1/onto, f+g, g∘f, inverse, f(x+h)
+//
+//  ใช้งานง่าย: คลิกการ์ด/เมนู, ช่องกรอกมีป้ายชื่อ+ตัวอย่าง, ปุ่ม "Example" เติมตัวอย่างให้,
+//  แผงปุ่มคณิตศาสตร์แทรกลงช่องที่เลือก, Tab = ช่องถัดไป, Enter = คำนวณ, Esc = ย้อนกลับ,
+//  ล้อเมาส์/PgUp/PgDn = เลื่อนผลลัพธ์
+//
+//  Build:  sudo apt install libx11-dev
+//          g++ -std=c++17 *.cpp -o calc -lX11      (หรือใช้ CMakeLists.txt)
+// ============================================================================
+#include "../lib/algebra.hpp"
+#include "../lib/Alpha_solver_eq.hpp"
+#include "../lib/Calculator_calculus.hpp"
+#include "../lib/function_solver.hpp"
+#include "../lib/math_graph.hpp"
+#include "../lib/math_logic.hpp"
+#include "../lib/matrix.hpp"
+#include "../lib/menu.hpp"
+#include "../lib/table_calculate.hpp"
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -852,6 +872,51 @@ static const char* DIST_LABELS[8][4] = {
     {"k", "N (population)", "K (successes)", "n (draws)"}, {"k", "p", "", ""},
     {"x", "mean (default 0)", "stdev (default 1)", ""}, {"x", "mean (default 0)", "stdev (default 1)", ""}};
 
+static ModelText MTxt(Feature& f, int d) {       // fields d..d+3 = Domain, Constants, Relations, Functions
+    ModelText t;
+    t.domain = LOpt(f, d); t.constants = LOpt(f, d + 1); t.relations = LOpt(f, d + 2); t.functions = LOpt(f, d + 3);
+    return t;
+}
+static const char* ADV_TABLEAU_TEXT =
+"TABLEAU RULES AND STRATEGY\n\n"
+"A tableau starts with the premises and the NEGATED conclusion. A branch CLOSES when it contains phi and ~phi.\n\n"
+"alpha rules (no split):\n"
+"   A & B        =>  A , B                 ~(A | B)   =>  ~A , ~B\n"
+"   ~(A -> B)    =>  A , ~B                ~~A        =>  A\n\n"
+"beta rules (the branch splits):\n"
+"   A | B        =>  A  |  B               ~(A & B)   =>  ~A  |  ~B\n"
+"   A -> B       =>  ~A  |  B              A <-> B    =>  (A , B)  |  (~A , ~B)\n"
+"   ~(A <-> B)   =>  (A , ~B)  |  (~A , B)\n\n"
+"gamma rules (universal; may be used again for every new constant):\n"
+"   forall x A(x)   =>  A(t) for EVERY ground term t on the branch\n"
+"   ~exists x A(x)  =>  ~A(t) for every t\n\n"
+"delta rules (existential; introduce a NEW constant c):\n"
+"   exists x A(x)   =>  A(c)                ~forall x A(x)  =>  ~A(c)\n\n"
+"Strategy used here: alpha, then delta, then beta, then gamma (gamma last, because it can be applied forever).\n\n"
+"Outcomes\n"
+"   all branches closed         => premises + ~conclusion unsatisfiable => the argument is VALID (soundness + completeness)\n"
+"   a complete open branch      => its constants and atoms form a COUNTER-MODEL (the argument is invalid)\n"
+"   an infinite branch          => no answer: first-order validity is only semi-decidable\n"
+"                                  (e.g. forall x exists y R(x,y) generates c1, c2, c3, ... forever)\n";
+static const char* ADV_SYNTAX_TEXT =
+"INPUT SYNTAX FOR THE ADVANCED LOGIC FEATURES\n\n"
+"First-order formulas\n"
+"   atoms        P(x)   R(x,y)   Rxy   f(x,a) = b   x != y      (Rxy is read as R(x,y) for single-letter terms)\n"
+"   connectives  ~   &   |   ->   <->      (also not and or implies iff, and the symbols of the notes)\n"
+"   quantifiers  forall x A    exists y A   bind tightly (like ~). For a long scope use a dot:  forall x. P(x) -> Q(x)\n"
+"   symbols      variables  u v w x y z (with digits);  constants  a b c john 0 1 ...;  functions  f(..) g(..)\n"
+"                predicates  start with a capital letter: P  Q  R  Man  Prime\n\n"
+"Models (finite)\n"
+"   Domain       m1, m2, m3          or   1..4\n"
+"   Constants    a=m1, b=m2\n"
+"   Relations    P={m1}; R={(m1,m1),(m1,m2)}        (empty relation:  P={})\n"
+"   Functions    f(m1)=m2, f(m2)=m1, g(m1,m2)=m1       (must be defined for every argument)\n"
+"   Assignment   x=m1, y=m2          (for formulas with free variables)\n\n"
+"Turing machines   rule:  state read -> newstate write move     e.g.  q0 1 -> q0 1 R   (move L, R or N; '_' = blank; '*' = any symbol)\n"
+"                  separate rules with ';'. The machine halts when no rule applies.\n\n"
+"Recursive functions   Z   S   P(i,k)   n (constant)   C(f; g1,g2)   R(g; h)   M(f)   and the library names add mul pred monus exp fact sg nsg dist\n"
+"Goedel numbering      symbols ~ & | -> <-> forall exists ( ) , = != + * letters digits  (see the code table in the output)\n";
+
 static void BuildCatalog() {
     // ===================== [1] Algebra =====================
     {
@@ -1399,6 +1464,122 @@ static void BuildCatalog() {
             })));
         g_cats.push_back(c);
     }
+    // ===================== [9] Advanced Logic (University) =====================
+    {
+        Category c{"Advanced Logic (University)", "First-order logic, models, tableaux, resolution, computability, Goedel", {}};
+        auto L = [](Feature f) { f.noWrap = true; return f; };
+        c.features.push_back(L(MkF("First-Order Formula Analyzer", "Well-formedness, language, free / bound variables, sentence?, complexity comp(phi), subformulas, terms.",
+            {TF("Formula", "e.g. forall x (P(x) -> exists y R(x,y))")},
+            [](Feature& f) -> std::string { return AdvancedLogic::analyzeFormula(LReq(f, 0)); },
+            {{"forall x (P(x) -> exists y R(x,y)) & Q(a)"}, {"Rxy | forall x Px"}, {"forall x (x = a -> P(f(x), b))"}, {"exists x forall y (R(x,y) <-> ~R(y,y))"}})));
+        c.features.push_back(L(MkF("Model Checker  (M |= phi)", "Evaluate a formula in a finite model with Tarski's clauses; the outer quantifiers are unrolled over the domain.",
+            {TF("Formula", "e.g. forall x exists y R(x,y)"), TF("Domain", "e.g. m1, m2, m3   or   1..4"), TF("Constants", "a=m1, b=m2"),
+             TF("Relations", "P={m1}; R={(m1,m1),(m1,m2)}"), TF("Functions", "f(m1)=m2, f(m2)=m1"), TF("Assignment (free variables)", "x=m1, y=m2")},
+            [](Feature& f) -> std::string { return AdvancedLogic::modelCheckReport(LReq(f, 0), MTxt(f, 1), LOpt(f, 5)); },
+            {{"forall x exists y R(x,y)", "m1, m2", "", "R={(m1,m1),(m1,m2),(m2,m2)}", "", ""},
+             {"forall x (P(x) -> R(x,x)) & exists x ~P(x)", "m1, m2, m3", "", "P={m1,m2}; R={(m1,m1),(m2,m2)}", "", ""},
+             {"P(x) & R(x,a)", "m1, m2", "a=m1", "P={m1}; R={(m1,m1),(m1,m2)}", "", "x=m1"},
+             {"forall x exists y f(x) = y & P(f(a))", "1, 2", "a=1", "P={2}", "f(1)=2, f(2)=1", ""}})));
+        {
+            Feature f = MkF("Finite Model Finder  (satisfiable / valid / consequence / counting)",
+                "Searches all interpretations on domains of size 1..N (N up to 8, at most 2^21 interpretations per size). Premises are optional.",
+                {CF("Question", {"Satisfiable? (find a model)", "Valid? (find a counter-model)", "Premises |= conclusion?", "Count models per size"}),
+                 TF("Sentence / conclusion", "e.g. forall x P(x) | forall x Q(x)"), TF("Max domain size", "3", "3"), TF("Premise 1", "e.g. forall x (P(x) | Q(x))")},
+                [](Feature& f) -> std::string {
+                    std::vector<std::string> prem;
+                    for (size_t i = 3; i < f.fields.size(); ++i) { std::string s = LOpt(f, (int)i); if (!s.empty()) prem.push_back(s); }
+                    int n = LOpt(f, 2).empty() ? 3 : atoi(LOpt(f, 2).c_str());
+                    static const AdvancedLogic::FinderMode modes[] = {AdvancedLogic::FinderMode::Satisfiable, AdvancedLogic::FinderMode::Validity,
+                                                                      AdvancedLogic::FinderMode::Consequence, AdvancedLogic::FinderMode::CountModels};
+                    return AdvancedLogic::findModelsReport(modes[Pick(f, 0)], LReq(f, 1), prem, n);
+                },
+                {{"2", "forall x P(x) | forall x Q(x)", "3", "forall x (P(x) | Q(x))"}, {"1", "forall x P(x) -> exists x P(x)", "3", ""},
+                 {"0", "forall x exists y R(x,y) & forall x ~R(x,x)", "3", ""}, {"3", "forall x (P(x) | ~P(x))", "3", ""},
+                 {"0", "exists x exists y ~(x = y) & forall x forall y forall z (x = y | x = z | y = z)", "3", ""}});
+            f.noWrap = true; f.dynLabel = "Premise"; f.dynStart = 3; f.dynMin = 1; f.dynMax = 8;
+            c.features.push_back(f);
+        }
+        {
+            Feature f = MkF("Tableau Prover  (first-order, with counter-models)",
+                "Proves premises |= conclusion by closing all branches; an open complete branch yields a counter-model. Leave the conclusion empty to test consistency.",
+                {TF("Conclusion", "e.g. forall x P(x) -> ~exists x ~P(x)"), TF("Premise 1", "e.g. forall x (P(x) -> Q(x))")},
+                [](Feature& f) -> std::string {
+                    std::vector<std::string> prem;
+                    for (size_t i = 1; i < f.fields.size(); ++i) { std::string s = LOpt(f, (int)i); if (!s.empty()) prem.push_back(s); }
+                    return AdvancedLogic::tableauReport(prem, LOpt(f, 0));
+                },
+                {{"forall x P(x) -> ~exists x ~P(x)", ""}, {"Q(a)", "forall x (P(x) -> Q(x))", "P(a)"}, {"forall x P(x) | forall x Q(x)", "forall x (P(x) | Q(x))"},
+                 {"exists y forall x R(x,y)", "forall x exists y R(x,y)"}, {"exists x (P(x) -> forall y P(y))", ""}});
+            f.noWrap = true; f.dynLabel = "Premise"; f.dynStart = 1; f.dynMin = 1; f.dynMax = 8;
+            c.features.push_back(f);
+        }
+        {
+            Feature f = MkF("Resolution Prover  (clauses, unification)",
+                "Refutation proof: Skolemise premises + negated conclusion, then resolve with most general unifiers until [] appears.",
+                {TF("Conclusion", "e.g. Mortal(socrates)"), TF("Premise 1", "e.g. forall x (Man(x) -> Mortal(x))"), TF("Premise 2", "e.g. Man(socrates)")},
+                [](Feature& f) -> std::string {
+                    std::vector<std::string> prem;
+                    for (size_t i = 1; i < f.fields.size(); ++i) { std::string s = LOpt(f, (int)i); if (!s.empty()) prem.push_back(s); }
+                    return AdvancedLogic::resolutionReport(prem, LOpt(f, 0));
+                },
+                {{"Mortal(socrates)", "forall x (Man(x) -> Mortal(x))", "Man(socrates)"}, {"forall x exists y R(y,x)", "forall x exists y R(x,y)", "forall x forall y (R(x,y) -> R(y,x))"},
+                 {"forall x P(x) | forall x Q(x)", "forall x (P(x) | Q(x))", ""}, {"exists x (P(x) -> forall y P(y))", "", ""}});
+            f.noWrap = true; f.dynLabel = "Premise"; f.dynStart = 1; f.dynMin = 1; f.dynMax = 8;
+            c.features.push_back(f);
+        }
+        c.features.push_back(L(MkF("Normal Forms: NNF, Prenex, Skolem, Clauses", "Negation normal form, prenex form (variables renamed apart), Skolem normal form and clause set of a first-order formula.",
+            {TF("Formula", "e.g. forall x (P(x) -> exists y (R(x,y) & ~Q(y)))")},
+            [](Feature& f) -> std::string { return AdvancedLogic::normalFormReport(LReq(f, 0)); },
+            {{"forall x (P(x) -> exists y (R(x,y) & ~Q(y)))"}, {"~(forall x P(x) -> exists y Q(y))"}, {"(exists x P(x)) & (forall y exists z R(y,z))"}})));
+        c.features.push_back(L(MkF("Unification  (most general unifier)", "Robinson's algorithm with occurs check for two terms or two atoms. Same variable name = same variable.",
+            {TF("Term / atom 1", "e.g. P(x, f(y))"), TF("Term / atom 2", "e.g. P(a, f(z))")},
+            [](Feature& f) -> std::string { return AdvancedLogic::unifyReport(LReq(f, 0), LReq(f, 1)); },
+            {{"P(x, f(y))", "P(a, f(z))"}, {"f(x, g(y))", "f(g(z), w)"}, {"x", "f(x)"}, {"f(x)", "g(a)"}})));
+        c.features.push_back(L(MkF("Models: Isomorphism, Submodels, Preservation", "Compare two finite models: isomorphic? is N a submodel of M? or check a sentence in both (Sigma_1 / Pi_1 preservation).",
+            {CF("Question", {"M and N isomorphic?", "N a submodel of M?", "Sentence in M and N (preservation)"}), TF("Sentence (3rd question)", "e.g. exists x R(x,x)"),
+             TF("M: Domain", "1, 2, 3"), TF("M: Constants", "a=1"), TF("M: Relations", "R={(1,2),(2,3)}"), TF("M: Functions", ""),
+             TF("N: Domain", "a, b, c"), TF("N: Constants", ""), TF("N: Relations", "R={(c,a),(a,b)}"), TF("N: Functions", "")},
+            [](Feature& f) -> std::string {
+                return AdvancedLogic::modelRelationReport(Pick(f, 0), MTxt(f, 2), MTxt(f, 6), LOpt(f, 1));
+            },
+            {{"0", "", "1, 2, 3", "", "R={(1,2),(2,3)}", "", "a, b, c", "", "R={(c,a),(a,b)}", ""},
+             {"1", "", "1, 2, 3", "", "P={1,2}; R={(1,1),(2,3)}", "", "1, 2", "", "P={1,2}; R={(1,1)}", ""},
+             {"2", "exists x exists y (P(x) & R(x,y))", "1, 2, 3", "", "P={1,2}; R={(1,1),(2,3)}", "", "1, 2", "", "P={1,2}; R={(1,1)}", ""},
+             {"2", "forall x forall y (R(x,y) -> P(x))", "1, 2, 3", "", "P={1,2}; R={(1,1),(2,3)}", "", "1, 2", "", "P={1,2}; R={(1,1)}", ""}})));
+        c.features.push_back(L(MkF("Cantor: Diagonal Argument & Power Set", "Build the diagonal sequence d that is missing from a list; and the diagonal set D = {x : x not in f(x)} for f : S -> P(S).",
+            {TF("Rows (H/T or 0/1)", "HHTHT, THTHT, TTTHH, HTHTT, TTTTH"), TF("Set | map f(x)", "a, b, c | a:{a,b}, b:{}, c:{a,c}")},
+            [](Feature& f) -> std::string { return AdvancedLogic::cantorReport(LOpt(f, 0), LOpt(f, 1)); },
+            {{"HHTHT, THTHT, TTTHH, HTHTT, TTTTH", "a, b, c | a:{a,b}, b:{}, c:{a,c}"}, {"0110, 1010, 0001, 1111", ""}, {"", "x, y, z, w"}})));
+        c.features.push_back(L(MkF("Turing Machine Simulator", "Rules  state read -> newstate write move  (move L R N), separated by ';'. Halts when no rule applies; step limit protects against non-halting machines.",
+            {TF("Rules", "q0 1 -> q0 1 R; q0 _ -> q1 1 N"), TF("Input tape", "111"), TF("Start state", "q0", "q0"), TF("Blank symbol", "_", "_"), TF("Max steps", "1000", "1000")},
+            [](Feature& f) -> std::string {
+                int steps = LOpt(f, 4).empty() ? 1000 : atoi(LOpt(f, 4).c_str());
+                return AdvancedLogic::turingReport(LReq(f, 0), LOpt(f, 1), LReq(f, 2), LOpt(f, 3), steps);
+            },
+            {{"q0 1 -> q0 1 R; q0 _ -> q1 1 N", "111", "q0", "_", "1000"},
+             {"b 0 -> b 0 R; b 1 -> b 1 R; b _ -> c _ L; c 1 -> c 0 L; c 0 -> h 1 N; c _ -> h 1 N", "1011", "b", "_", "1000"},
+             {"A 0 -> B 1 R; A 1 -> B 1 L; B 0 -> A 1 L; B 1 -> H 1 N", "", "A", "0", "1000"},
+             {"s 0 -> s 0 R; s 1 -> s 1 R", "101", "s", "_", "20"}})));
+        c.features.push_back(L(MkF("Recursive Functions (Goedel's schema, mu-recursion)", "Evaluate expressions built from Z, S, P(i,k), C, R, M; show the library; or compute the Ackermann function.",
+            {CF("Mode", {"Evaluate expression", "Show schema + library", "Ackermann A(m,n)"}), TF("Function", "add   or   R(P(1,1); C(S; P(3,3)))"), TF("Arguments", "3,4")},
+            [](Feature& f) -> std::string { return AdvancedLogic::recursiveReport(Pick(f, 0), LOpt(f, 1), LOpt(f, 2)); },
+            {{"0", "add", "3,4"}, {"0", "R(P(1,1); C(S; P(3,3)))", "10,20"}, {"0", "M(C(monus; P(1,2), C(mul; P(2,2), P(2,2))))", "50"},
+             {"0", "C(mul; fact, fact)", "4"}, {"1", "", ""}, {"2", "", "3,3"}})));
+        c.features.push_back(L(MkF("Goedel Numbering, Pairing, Sequence Coding", "Arithmetisation of syntax: encode / decode formulas as numbers, Cantor pairing pi(x,y), coding of finite sequences.",
+            {CF("Mode", {"Encode a formula", "Decode a number", "Cantor pairing / unpairing", "Sequence coding"}), TF("Input", "formula, number, 'x,y' or 'a1,a2,...'")},
+            [](Feature& f) -> std::string { return AdvancedLogic::godelReport(Pick(f, 0), LReq(f, 1)); },
+            {{"0", "forall x (P(x) -> Q(x))"}, {"0", "~P(a)"}, {"1", "31796978159818222112714919699065011830798946688570267567791406250"}, {"2", "3,4"}, {"2", "32"}, {"3", "3,1,4"}})));
+        c.features.push_back(L(MkF("Reference: overview, tableau rules, input syntax", "Summary of the advanced logic notes, the tableau rules and strategy, and the input syntax of this category.",
+            {CF("Topic", {"Overview of advanced logic (notes)", "Tableau rules & strategy", "Input syntax"})},
+            [](Feature& f) -> std::string {
+                switch (Pick(f, 0)) {
+                    case 0: return AdvancedLogic::advancedOverview();
+                    case 1: return ADV_TABLEAU_TEXT;
+                    default: return ADV_SYNTAX_TEXT;
+                }
+            })));
+        g_cats.push_back(c);
+    }
 }
 
 // ============================================================
@@ -1500,7 +1681,8 @@ static void ScreenMenu() {
     Category& cat = g_cats[g_cat];
     TopBar(cat.title);
     DrawText_(20, 58, cat.sub, COL_DIM, g_fontS);
-    int x = 20, w = std::min(g_w - 40, 900), h = 46, gap = 6, y = 90;
+    int x = 20, w = std::min(g_w - 40, 900), gap = 6, y = 90;
+    int h = std::clamp((g_h - y - 10) / std::max(1, (int)cat.features.size()) - gap, 34, 46);
     for (size_t i = 0; i < cat.features.size(); ++i) {
         Feature& f = cat.features[i];
         bool over = Hit(x, y, w, h);
@@ -1686,6 +1868,15 @@ static const FKey LOGIC_KEYS[42] = {
     {">",">",COL_NUM},{"<","<",COL_NUM},{">=",">=",COL_NUM},{"<=","<=",COL_NUM},{"=","=",COL_NUM},{"!=","!=",COL_NUM},
     {",",",",COL_OP},{"..","..",COL_OP},{"DEL","<DEL>",COL_CLEAR},{"CLR","<CLR>",COL_CLEAR},{"space"," ",COL_OP},{"^","^",COL_OP},
 };
+static const FKey ADV_KEYS[42] = {
+    {"P","P",COL_BTN},{"Q","Q",COL_BTN},{"R","R",COL_BTN},{"x","x",COL_BTN},{"y","y",COL_BTN},{"z","z",COL_BTN},
+    {"a","a",COL_NUM},{"b","b",COL_NUM},{"f","f",COL_NUM},{"(","(",COL_OP},{")",")",COL_OP},{",",",",COL_OP},
+    {"forall","forall ",COL_BTN},{"exists","exists ",COL_BTN},{"~","~",COL_OP},{"&","&",COL_OP},{"|","|",COL_OP},{"=","=",COL_OP},
+    {"->","->",COL_OP},{"<->","<->",COL_OP},{"!=","!=",COL_OP},{".",".",COL_OP},{"{","{",COL_BTN},{"}","}",COL_BTN},
+    {"0","0",COL_NUM},{"1","1",COL_NUM},{"2","2",COL_NUM},{"3","3",COL_NUM},{"4","4",COL_NUM},{"5","5",COL_NUM},
+    {"m1","m1",COL_NUM},{"m2","m2",COL_NUM},{"m3","m3",COL_NUM},{"H","H",COL_NUM},{"T","T",COL_NUM},{"_","_",COL_NUM},
+    {";",";",COL_OP},{":",":",COL_OP},{"space"," ",COL_OP},{"S","S",COL_BTN},{"DEL","<DEL>",COL_CLEAR},{"CLR","<CLR>",COL_CLEAR},
+};
 static void MathKeypad(int x, int bottom, int w, const FKey* keys) {
     int cols = 6, rows = 7, gap = 4, kh = 28;
     int kw = (w - (cols - 1) * gap) / cols;
@@ -1803,7 +1994,7 @@ static void ScreenForm() {
         Defer([&f] { for (auto& fd : f.fields) { if (fd.choices.empty()) fd.value.clear(); } f.result.clear(); f.error.clear(); ResetFocus(); });
     }
     y += 44;
-    MathKeypad(lx, g_h - 10, lw, g_cats[g_cat].title == "Mathematical Logic" ? LOGIC_KEYS : FORM_KEYS);
+    MathKeypad(lx, g_h - 10, lw, g_cats[g_cat].title == "Mathematical Logic" ? LOGIC_KEYS : g_cats[g_cat].title == "Advanced Logic (University)" ? ADV_KEYS : FORM_KEYS);
 
     // ---- แผงขวา ----
     int rx = lx + lw + 12, rw = g_w - rx - 10, ry = 56;
