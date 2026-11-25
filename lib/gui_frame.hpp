@@ -1,8 +1,3 @@
-
-//
-//  Build:  sudo apt install libwayland-dev libxkbcommon-dev libdecor-0-dev libcairo2-dev fonts-dejavu-core
-//          g++ -std=c++17 *.cpp -o calc $(pkg-config --cflags --libs wayland-client wayland-cursor xkbcommon libdecor-0 cairo)
-// ============================================================================
 #include "../lib/algebra.hpp"
 #include "../lib/Alpha_solver_eq.hpp"
 #include "../lib/Calculator_calculus.hpp"
