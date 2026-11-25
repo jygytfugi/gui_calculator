@@ -22,14 +22,26 @@ file(GLOB SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
 )
 
-# main.cpp เป็น GUI ที่ใช้ Xlib (Linux): sudo apt install libx11-dev
-find_package(X11 REQUIRED)
-include_directories(${X11_INCLUDE_DIR})
+# ค้นหาแพ็กเกจ Wayland, libdecor, xkbcommon และ cairo ผ่าน pkg-config
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(Wayland REQUIRED 
+    wayland-client
+    wayland-cursor
+    wayland-egl
+    xkbcommon
+    libdecor-0
+    cairo
+)
+
+# เพิ่ม Include และ Library directories ของ Wayland/libdecor/cairo
+include_directories(${Wayland_INCLUDE_DIRS})
+link_directories(${Wayland_LIBRARY_DIRS})
 
 # สร้าง Executable จากไฟล์ .cpp ทั้งหมดที่หาเจอ
 add_executable(MyCalculator ${SOURCES})
 
-target_link_libraries(MyCalculator PRIVATE ${X11_LIBRARIES})
+# ลิงก์ไลบรารีทั้งหมด
+target_link_libraries(MyCalculator PRIVATE ${Wayland_LIBRARIES})
 
 if(MSVC)
     target_compile_options(MyCalculator PRIVATE /W3)

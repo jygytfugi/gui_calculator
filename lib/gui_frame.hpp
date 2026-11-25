@@ -1,23 +1,7 @@
-// ============================================================================
-//  MATHS SOLVER SYSTEM  -  GUI เครื่องคิดเลขแบบมีปุ่มกด (Linux / X11)  [แก้เฉพาะ main.cpp]
+
 //
-//  ฟีเจอร์ครบเหมือนเวอร์ชัน terminal (menu.cpp) ทั้ง 7 หมวด:
-//   [1] Algebra Calculator  - คำนวณต่อเนื่อง + ans + ประวัติ (คลิกประวัติเพื่อเรียกกลับมาแก้)
-//   [2] Calculus Solver     - อนุพันธ์/ปริพันธ์/ลิมิต (ตัวเลข+สัญลักษณ์)
-//   [3] Alpha Equation      - พหุนาม, แยกตัวประกอบ, f(x)=0, สมการอนุพันธ์/อินทิกรัล/ลิมิต, lhs=rhs,
-//                             ระบบสมการเชิงเส้น/ไม่เชิงเส้น (กี่สมการ กี่ตัวแปรก็ได้)
-//   [4] 2D Graph Plotter    - 9 แบบ + ซูมเข้า/ออก/เลื่อน/ตั้งช่วง x/ความละเอียด
-//   [5] Multi-Matrix        - เมทริกซ์ N ตัว ขนาด n x m (สูงสุด 12 x 12) บวก/ลบ/คูณ N ตัว, transpose,
-//                             det, inverse, อนุพันธ์/ปริพันธ์ทีละสมาชิก, แก้ AX=B, เก็บผลลัพธ์เป็นเมทริกซ์ใหม่
-//   [6] Table & Probability - ตารางข้อมูล+สถิติ, binomial/poisson/Z table, ตัวคำนวณการแจกแจง, nCr/nPr, joint table
-//   [7] Relations/Functions - Cartesian N เซต, relation, domain/range, 1-1/onto, f+g, g∘f, inverse, f(x+h)
-//
-//  ใช้งานง่าย: คลิกการ์ด/เมนู, ช่องกรอกมีป้ายชื่อ+ตัวอย่าง, ปุ่ม "Example" เติมตัวอย่างให้,
-//  แผงปุ่มคณิตศาสตร์แทรกลงช่องที่เลือก, Tab = ช่องถัดไป, Enter = คำนวณ, Esc = ย้อนกลับ,
-//  ล้อเมาส์/PgUp/PgDn = เลื่อนผลลัพธ์
-//
-//  Build:  sudo apt install libx11-dev
-//          g++ -std=c++17 *.cpp -o calc -lX11      (หรือใช้ CMakeLists.txt)
+//  Build:  sudo apt install libwayland-dev libxkbcommon-dev libdecor-0-dev libcairo2-dev fonts-dejavu-core
+//          g++ -std=c++17 *.cpp -o calc $(pkg-config --cflags --libs wayland-client wayland-cursor xkbcommon libdecor-0 cairo)
 // ============================================================================
 #include "../lib/algebra.hpp"
 #include "../lib/Alpha_solver_eq.hpp"
@@ -29,10 +13,18 @@
 #include "../lib/menu.hpp"
 #include "../lib/table_calculate.hpp"
 
-#include <X11/Xlib.h>
-#include <X11/Xutil.h>
-#include <X11/keysym.h>
-#include <X11/Xatom.h>
+#include <wayland-client.h>
+#include <wayland-cursor.h>
+#include <xkbcommon/xkbcommon.h>
+#include <libdecor.h>
+#include <cairo.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/input-event-codes.h>
+#include <poll.h>
+#include <sys/mman.h>
+#include <time.h>
+#include <unistd.h>
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -66,29 +58,99 @@ static const uint32_t COL_OK      = RGB32(46, 160, 90);
 static const uint32_t COL_CLEAR   = RGB32(190, 60, 60);
 static const uint32_t COL_CHIP    = RGB32(60, 66, 80);
 
-// ---------- X11 / framebuffer state ----------
-static Display* g_dpy = nullptr;
-static Window g_win;
-static GC g_gc;
-static XFontStruct* g_fontS = nullptr;   // ฟอนต์ปุ่ม/ช่องกรอก
-static XFontStruct* g_fontM = nullptr;   // ฟอนต์ monospace สำหรับผลลัพธ์/กราฟ
-static XFontStruct* g_fontL = nullptr;   // ฟอนต์ใหญ่ (หัวข้อ)
-static XImage* g_img = nullptr;
-static uint32_t* g_px = nullptr;
+// ---------- Wayland / framebuffer state ----------
+// ฟอนต์: วาดด้วย cairo (ฟอนต์ monospace ของระบบผ่าน fontconfig) แต่คงขนาดช่องตัวอักษรเท่าฟอนต์ X11 เดิม
+//   S = 9x15 (ปุ่ม/ช่องกรอก)   M = 7x13 (ผลลัพธ์/กราฟ)   L = 10x20 (หัวข้อ)
+// เปลี่ยนฟอนต์ได้ด้วยตัวแปรสภาพแวดล้อม MATHS_FONT เช่น  MATHS_FONT="JetBrains Mono" ./calc
+struct GuiFont { int cw, h, ascent, descent; double size; };
+static GuiFont g_fontSd = {9, 15, 12, 3, 0.0};
+static GuiFont g_fontMd = {7, 13, 11, 2, 0.0};
+static GuiFont g_fontLd = {10, 20, 16, 4, 0.0};
+static GuiFont* g_fontS = &g_fontSd;    // ฟอนต์ปุ่ม/ช่องกรอก
+static GuiFont* g_fontM = &g_fontMd;    // ฟอนต์ monospace สำหรับผลลัพธ์/กราฟ
+static GuiFont* g_fontL = &g_fontLd;    // ฟอนต์ใหญ่ (หัวข้อ)
+static std::string g_fontFamily = "monospace";
+
+static wl_display*             g_wl = nullptr;
+static wl_registry*            g_registry = nullptr;
+static wl_compositor*          g_compositor = nullptr;
+static wl_shm*                 g_shm = nullptr;
+static wl_seat*                g_seat = nullptr;
+static wl_data_device_manager* g_ddm = nullptr;
+static wl_data_device*         g_dataDev = nullptr;
+static wl_surface*             g_surf = nullptr;
+static libdecor*               g_dec = nullptr;       // ขอบหน้าต่าง/ไตเติลบาร์ (ใช้ได้ทั้ง GNOME, KDE, sway ...)
+static libdecor_frame*         g_frame = nullptr;
+static bool g_running = true, g_configured = false;
+
+static uint32_t* g_px = nullptr;          // พิกเซลของบัฟเฟอร์ที่กำลังวาดอยู่ (XRGB8888)
 static int g_w = 0, g_h = 0;
 
+// wl_shm: 3 บัฟเฟอร์ใน pool เดียว  (วาดลงบัฟเฟอร์ที่ compositor ปล่อยแล้วเท่านั้น)
+struct ShmBuf { wl_buffer* buf = nullptr; uint32_t* data = nullptr; bool busy = false; };
+static const int NBUF = 3;
+static ShmBuf g_bufs[NBUF];
+static void* g_poolMem = nullptr;
+static size_t g_poolSize = 0;
+
+static int CreateShmFile(size_t size) {
+    int fd = -1;
+#ifdef MFD_CLOEXEC
+    fd = memfd_create("maths-solver-shm", MFD_CLOEXEC);
+#endif
+    if (fd < 0) {
+        const char* dir = getenv("XDG_RUNTIME_DIR");
+        if (!dir) return -1;
+        std::string path = std::string(dir) + "/maths-solver-XXXXXX";
+        std::vector<char> tmpl(path.begin(), path.end());
+        tmpl.push_back('\0');
+        fd = mkostemp(tmpl.data(), O_CLOEXEC);
+        if (fd >= 0) unlink(tmpl.data());
+    }
+    if (fd < 0) return -1;
+    if (ftruncate(fd, (off_t)size) < 0) { close(fd); return -1; }
+    return fd;
+}
+static void BufRelease(void* data, wl_buffer*) { ((ShmBuf*)data)->busy = false; }
+static const wl_buffer_listener g_bufListener = { BufRelease };
+
+static void DestroyBuffers() {
+    for (auto& b : g_bufs) { if (b.buf) wl_buffer_destroy(b.buf); b = ShmBuf(); }
+    if (g_poolMem) { munmap(g_poolMem, g_poolSize); g_poolMem = nullptr; g_poolSize = 0; }
+    g_px = nullptr;
+}
 static void CreateBuffer(int w, int h) {
-    if (w <= 0 || h <= 0) return;
-    if (g_img) XDestroyImage(g_img);               // also frees g_px
-    g_px = (uint32_t*)calloc((size_t)w * h, 4);
-    int screen = DefaultScreen(g_dpy);
-    g_img = XCreateImage(g_dpy, DefaultVisual(g_dpy, screen), DefaultDepth(g_dpy, screen),
-                         ZPixmap, 0, (char*)g_px, w, h, 32, 0);
+    if (w <= 0 || h <= 0 || !g_shm) return;
+    DestroyBuffers();
+    size_t stride = (size_t)w * 4, one = stride * (size_t)h, total = one * NBUF;
+    int fd = CreateShmFile(total);
+    if (fd < 0) { fprintf(stderr, "Cannot create shared-memory buffer\n"); g_running = false; return; }
+    void* mem = mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mem == MAP_FAILED) { close(fd); fprintf(stderr, "mmap failed\n"); g_running = false; return; }
+    wl_shm_pool* pool = wl_shm_create_pool(g_shm, fd, (int32_t)total);
+    for (int i = 0; i < NBUF; ++i) {
+        g_bufs[i].data = (uint32_t*)((char*)mem + (size_t)i * one);
+        g_bufs[i].buf = wl_shm_pool_create_buffer(pool, (int32_t)((size_t)i * one), w, h, (int32_t)stride,
+                                                  WL_SHM_FORMAT_XRGB8888);
+        wl_buffer_add_listener(g_bufs[i].buf, &g_bufListener, &g_bufs[i]);
+    }
+    wl_shm_pool_destroy(pool);
+    close(fd);
+    g_poolMem = mem; g_poolSize = total;
     g_w = w; g_h = h;
+    g_px = g_bufs[0].data;
+}
+// หาบัฟเฟอร์ที่ว่าง (ถ้า compositor ยังไม่ปล่อย จะรอรับ event สักครู่)
+static int AcquireBuffer() {
+    for (int tries = 0; tries < 100 && g_running; ++tries) {
+        for (int i = 0; i < NBUF; ++i) if (g_bufs[i].buf && !g_bufs[i].busy) return i;
+        if (libdecor_dispatch(g_dec, 10) < 0) break;
+    }
+    return -1;
 }
 
 // ---------- Drawing primitives ----------
-struct TextCmd { int x, y; std::string s; uint32_t c; XFontStruct* f; };
+struct TextCmd { int x, y; std::string s; uint32_t c; GuiFont* f; };
 static std::vector<TextCmd> g_text;
 
 static void FillRectPx(int x, int y, int w, int h, uint32_t c) {
@@ -101,28 +163,87 @@ static void Border(int x, int y, int w, int h, uint32_t c) {
     FillRectPx(x, y, w, 1, c); FillRectPx(x, y + h - 1, w, 1, c);
     FillRectPx(x, y, 1, h, c); FillRectPx(x + w - 1, y, 1, h, c);
 }
-static int TextW(XFontStruct* f, const std::string& s) {
-    return f ? XTextWidth(f, s.c_str(), (int)s.size()) : (int)s.size() * 8;
+// ฟอนต์ monospace: ความกว้าง = จำนวนตัวอักษร (นับเป็น UTF-8 code point) x ความกว้างช่อง
+static int Utf8Len(const std::string& s) {
+    int n = 0;
+    for (unsigned char c : s) if ((c & 0xC0) != 0x80) ++n;
+    return n;
 }
-static int FontH(XFontStruct* f) { return f ? f->ascent + f->descent : 14; }
-static int CharW(XFontStruct* f) { return f ? std::max(1, (int)f->max_bounds.width) : 8; }
+static int TextW(const GuiFont* f, const std::string& s) { return Utf8Len(s) * (f ? f->cw : 8); }
+static int FontH(const GuiFont* f) { return f ? f->ascent + f->descent : 14; }
+static int CharW(const GuiFont* f) { return f ? std::max(1, f->cw) : 8; }
 
-static void DrawText_(int x, int y, const std::string& s, uint32_t c, XFontStruct* f) {
+static void DrawText_(int x, int y, const std::string& s, uint32_t c, GuiFont* f) {
     if (!s.empty()) g_text.push_back({x, y, s, c, f});    // y = ขอบบนของข้อความ
 }
-static void DrawTextCenter(int cx, int cy, const std::string& s, uint32_t c, XFontStruct* f) {
+static void DrawTextCenter(int cx, int cy, const std::string& s, uint32_t c, GuiFont* f) {
     DrawText_(cx - TextW(f, s) / 2, cy - FontH(f) / 2, s, c, f);
 }
-static void DrawTextRight(int xr, int y, const std::string& s, uint32_t c, XFontStruct* f) {
+static void DrawTextRight(int xr, int y, const std::string& s, uint32_t c, GuiFont* f) {
     DrawText_(xr - TextW(f, s), y, s, c, f);
 }
-static std::string FitTail(XFontStruct* f, std::string s, int maxW) {
-    while (!s.empty() && TextW(f, s) > maxW) s.erase(0, 1);
-    return s;
+// ตัดให้พอดีความกว้าง maxW (เก็บ "ท้าย" ของข้อความ)
+static std::string FitTail(GuiFont* f, std::string s, int maxW) {
+    int maxc = std::max(0, maxW / CharW(f)), n = Utf8Len(s);
+    size_t i = 0;
+    while (n > maxc && i < s.size()) {
+        ++i; while (i < s.size() && ((unsigned char)s[i] & 0xC0) == 0x80) ++i;
+        --n;
+    }
+    return s.substr(i);
 }
-static std::string FitHead(XFontStruct* f, std::string s, int maxW) {
-    while (!s.empty() && TextW(f, s) > maxW) s.pop_back();
-    return s;
+// ตัดให้พอดีความกว้าง maxW (เก็บ "หัว" ของข้อความ)
+static std::string FitHead(GuiFont* f, std::string s, int maxW) {
+    int maxc = std::max(0, maxW / CharW(f));
+    if (Utf8Len(s) <= maxc) return s;
+    size_t i = 0; int n = 0;
+    while (i < s.size() && n < maxc) {
+        ++i; while (i < s.size() && ((unsigned char)s[i] & 0xC0) == 0x80) ++i;
+        ++n;
+    }
+    return s.substr(0, i);
+}
+
+// หาขนาดฟอนต์ cairo ที่ทำให้ความกว้างตัวอักษร = ความกว้างช่องของแต่ละขนาด
+static void InitFonts() {
+    const char* fam = getenv("MATHS_FONT");
+    if (fam && *fam) g_fontFamily = fam;
+    cairo_surface_t* s = cairo_image_surface_create(CAIRO_FORMAT_RGB24, 1, 1);
+    cairo_t* cr = cairo_create(s);
+    cairo_select_font_face(cr, g_fontFamily.c_str(), CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr, 100.0);
+    cairo_text_extents_t te;
+    cairo_text_extents(cr, "M", &te);
+    double ratio = te.x_advance / 100.0;
+    if (ratio < 0.2 || ratio > 1.5) ratio = 0.6;
+    for (GuiFont* f : {&g_fontSd, &g_fontMd, &g_fontLd}) f->size = f->cw / ratio;
+    cairo_destroy(cr);
+    cairo_surface_destroy(s);
+}
+// วาดข้อความทั้งหมดของเฟรมทับลงบนบัฟเฟอร์พิกเซล
+static void FlushText() {
+    if (g_text.empty() || !g_px) return;
+    cairo_surface_t* sf = cairo_image_surface_create_for_data((unsigned char*)g_px, CAIRO_FORMAT_RGB24,
+                                                              g_w, g_h, g_w * 4);
+    cairo_t* cr = cairo_create(sf);
+    cairo_font_options_t* fo = cairo_font_options_create();
+    cairo_font_options_set_antialias(fo, CAIRO_ANTIALIAS_GRAY);
+    cairo_font_options_set_hint_style(fo, CAIRO_HINT_STYLE_SLIGHT);
+    cairo_font_options_set_hint_metrics(fo, CAIRO_HINT_METRICS_ON);
+    cairo_set_font_options(cr, fo);
+    cairo_font_options_destroy(fo);
+    cairo_select_font_face(cr, g_fontFamily.c_str(), CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    const GuiFont* cur = nullptr;
+    for (const auto& t : g_text) {
+        const GuiFont* f = t.f ? t.f : g_fontS;
+        if (f != cur) { cur = f; cairo_set_font_size(cr, f->size); }
+        cairo_set_source_rgb(cr, ((t.c >> 16) & 255) / 255.0, ((t.c >> 8) & 255) / 255.0, (t.c & 255) / 255.0);
+        cairo_move_to(cr, t.x, t.y + f->ascent);
+        cairo_show_text(cr, t.s.c_str());
+    }
+    cairo_destroy(cr);
+    cairo_surface_flush(sf);
+    cairo_surface_destroy(sf);
 }
 
 // ---------- Immediate-mode UI ----------
@@ -146,7 +267,7 @@ static uint32_t Shade(uint32_t c, int d) {
 
 // ปุ่มทั่วไป (คืน true เมื่อคลิก)
 static bool DrawButton(int x, int y, int w, int h, const std::string& label, uint32_t base,
-                       XFontStruct* font = nullptr, bool selected = false) {
+                       GuiFont* font = nullptr, bool selected = false) {
     int id = NextId();
     bool over = Hit(x, y, w, h);
     if (over && ui.pressed) ui.active = id;
@@ -156,7 +277,7 @@ static bool DrawButton(int x, int y, int w, int h, const std::string& label, uin
     FillRectPx(x, y, w, h, bg);
     Border(x, y, w, h, selected ? RGB32(255, 255, 255) : Shade(base, -50));
     if (selected) Border(x + 1, y + 1, w - 2, h - 2, RGB32(255, 255, 255));
-    XFontStruct* f = font ? font : g_fontS;
+    GuiFont* f = font ? font : g_fontS;
     if (TextW(f, label) > w - 6 && f == g_fontS) f = g_fontM;
     DrawTextCenter(x + w / 2, y + h / 2, FitHead(f, label, w - 4), RGB32(255, 255, 255), f);
     return clicked;
@@ -168,7 +289,7 @@ static std::vector<std::string*> g_tabNow, g_tabPrev;
 static void ResetFocus() { g_focusStr = nullptr; }
 
 static bool TextBox(int x, int y, int w, int h, std::string& s, const std::string& hint,
-                    XFontStruct* f = nullptr) {
+                    GuiFont* f = nullptr) {
     if (!f) f = g_fontS;
     bool over = Hit(x, y, w, h);
     bool clicked = over && ui.pressed;
@@ -1789,7 +1910,7 @@ static void ScreenCalc() {
             for (size_t i = 0; i < el.size() && i < 3; ++i) DrawText_(lx + 10, ry + (int)i * (FontH(g_fontM) + 1), el[i], COL_RED, g_fontM);
         } else if (!g_cResult.empty()) {
             std::string r = g_cResult;
-            XFontStruct* f = TextW(g_fontL, r) <= lw - 24 ? g_fontL : g_fontS;
+            GuiFont* f = TextW(g_fontL, r) <= lw - 24 ? g_fontL : g_fontS;
             DrawTextRight(lx + lw - 12, ry + 4, FitTail(f, r, lw - 24), COL_GREEN, f);
         }
     }
@@ -2533,6 +2654,9 @@ static void Frame() {
     }
 }
 static void Present() {
+    int bi = AcquireBuffer();
+    if (bi < 0) return;
+    g_px = g_bufs[bi].data;
     g_tabPrev = g_tabNow; g_tabNow.clear();
     g_text.clear();
     Frame();
@@ -2542,22 +2666,14 @@ static void Present() {
     auto jobs = std::move(g_deferred);
     g_deferred.clear();
     for (auto& j : jobs) j();
-    XPutImage(g_dpy, g_win, g_gc, g_img, 0, 0, 0, 0, g_w, g_h);
-    for (auto& t : g_text) {
-        XSetForeground(g_dpy, g_gc, t.c);
-        if (t.f) XSetFont(g_dpy, g_gc, t.f->fid);
-        int asc = t.f ? t.f->ascent : 12;
-        XDrawString(g_dpy, g_win, g_gc, t.x, t.y + asc, t.s.c_str(), (int)t.s.size());
-    }
-    XFlush(g_dpy);
+    FlushText();
+    g_bufs[bi].busy = true;
+    wl_surface_attach(g_surf, g_bufs[bi].buf, 0, 0);
+    if (wl_surface_get_version(g_surf) >= 4) wl_surface_damage_buffer(g_surf, 0, 0, g_w, g_h);
+    else wl_surface_damage(g_surf, 0, 0, g_w, g_h);
+    wl_surface_commit(g_surf);
+    wl_display_flush(g_wl);
 }
-static XFontStruct* LoadFont(const char* a, const char* b, const char* c) {
-    XFontStruct* f = XLoadQueryFont(g_dpy, a);
-    if (!f) f = XLoadQueryFont(g_dpy, b);
-    if (!f) f = XLoadQueryFont(g_dpy, c);
-    return f;
-}
-static Atom g_atomClip = 0, g_atomProp = 0;
 static void PasteText(std::string s) {
     std::string o;
     for (char c : s) {
@@ -2570,14 +2686,6 @@ static void PasteText(std::string s) {
     if (o.empty()) return;
     if (g_screen == S_CALC) CalcInsert(o);
     else if (g_focusStr) *g_focusStr += o;
-}
-static void RequestPaste(Atom sel) { XConvertSelection(g_dpy, sel, XA_STRING, g_atomProp, g_win, CurrentTime); }
-static void HandleSelection(const XSelectionEvent& se) {
-    if (se.property == None) return;
-    Atom type; int fmt; unsigned long n, after; unsigned char* data = nullptr;
-    if (XGetWindowProperty(g_dpy, g_win, se.property, 0, 1 << 24, True, AnyPropertyType, &type, &fmt, &n, &after, &data) != Success || !data) return;
-    PasteText(std::string((char*)data, n * (fmt / 8)));
-    XFree(data);
 }
 static void TypeChar(char c) {
     if (g_screen == S_CALC) CalcInsert(std::string(1, c));
@@ -2593,96 +2701,369 @@ static void FocusNext(bool back) {
     g_focusStr = g_tabPrev[idx];
 }
 
-int main_gui() {
-    g_dpy = XOpenDisplay(nullptr);
-    if (!g_dpy) { fprintf(stderr, "Cannot open X display\n"); return 1; }
-    int screen = DefaultScreen(g_dpy);
-    g_atomClip = XInternAtom(g_dpy, "CLIPBOARD", False);
-    g_atomProp = XInternAtom(g_dpy, "PASTE_BUF", False);
-    const int W0 = 1040, H0 = 800;
-    g_win = XCreateSimpleWindow(g_dpy, RootWindow(g_dpy, screen), 0, 0, W0, H0, 0,
-                                BlackPixel(g_dpy, screen), WhitePixel(g_dpy, screen));
-    XStoreName(g_dpy, g_win, "Maths Solver System");
-    XSizeHints hints;
-    memset(&hints, 0, sizeof hints);
-    hints.flags = PMinSize;
-    hints.min_width = 940; hints.min_height = 700;
-    XSetWMNormalHints(g_dpy, g_win, &hints);
-    XSelectInput(g_dpy, g_win, ExposureMask | StructureNotifyMask | PointerMotionMask |
-                               ButtonPressMask | ButtonReleaseMask | KeyPressMask);
-    Atom wmDelete = XInternAtom(g_dpy, "WM_DELETE_WINDOW", False);
-    XSetWMProtocols(g_dpy, g_win, &wmDelete, 1);
-    g_gc = XCreateGC(g_dpy, g_win, 0, nullptr);
-    g_fontS = LoadFont("9x15", "8x13", "fixed");
-    g_fontM = LoadFont("7x13", "6x13", "fixed");
-    g_fontL = LoadFont("10x20", "9x15", "fixed");
-    if (!g_fontM) g_fontM = g_fontS;
-    if (!g_fontL) g_fontL = g_fontS;
+// ============================================================
+//                 Wayland: เหตุการณ์ / คลิปบอร์ด
+// ============================================================
+static bool g_needRedraw = false, g_extra = false;   // g_extra = วาดซ้ำอีกรอบเพื่อให้เห็นผลคลิก/พิมพ์ทันที
+static int64_t NowMs() {
+    timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
+// ---------- คลิปบอร์ด (wl_data_device) ----------
+struct OfferInfo { bool utf8 = false, plain = false, utf8str = false, str = false; };
+static std::map<wl_data_offer*, OfferInfo> g_offers;
+static wl_data_offer* g_clip = nullptr;       // selection ปัจจุบัน (Ctrl+C จากโปรแกรมอื่น)
+static wl_data_offer* g_dndOffer = nullptr;   // offer จากการลากวาง (ไม่ใช้ แค่ต้องคืนทรัพยากร)
+
+static void OfferMime(void* data, wl_data_offer*, const char* mime) {
+    OfferInfo* inf = (OfferInfo*)data;
+    if (!strcmp(mime, "text/plain;charset=utf-8")) inf->utf8 = true;
+    else if (!strcmp(mime, "text/plain")) inf->plain = true;
+    else if (!strcmp(mime, "UTF8_STRING")) inf->utf8str = true;
+    else if (!strcmp(mime, "STRING")) inf->str = true;
+}
+static void OfferSourceActions(void*, wl_data_offer*, uint32_t) {}
+static void OfferAction(void*, wl_data_offer*, uint32_t) {}
+static const wl_data_offer_listener g_offerListener = { OfferMime, OfferSourceActions, OfferAction };
+
+static void DestroyOffer(wl_data_offer*& o) {
+    if (!o) return;
+    if (g_offers.erase(o)) wl_data_offer_destroy(o);
+    o = nullptr;
+}
+static void DdDataOffer(void*, wl_data_device*, wl_data_offer* o) {
+    OfferInfo& inf = g_offers[o];
+    wl_data_offer_add_listener(o, &g_offerListener, &inf);
+}
+static void DdEnter(void*, wl_data_device*, uint32_t, wl_surface*, wl_fixed_t, wl_fixed_t, wl_data_offer* o) {
+    DestroyOffer(g_dndOffer);
+    g_dndOffer = o;
+}
+static void DdLeave(void*, wl_data_device*) { DestroyOffer(g_dndOffer); }
+static void DdMotion(void*, wl_data_device*, uint32_t, wl_fixed_t, wl_fixed_t) {}
+static void DdDrop(void*, wl_data_device*) { DestroyOffer(g_dndOffer); }
+static void DdSelection(void*, wl_data_device*, wl_data_offer* o) {
+    DestroyOffer(g_clip);
+    g_clip = o;
+}
+static const wl_data_device_listener g_ddListener = { DdDataOffer, DdEnter, DdLeave, DdMotion, DdDrop, DdSelection };
+
+static void RequestPaste() {
+    if (!g_clip) return;
+    auto it = g_offers.find(g_clip);
+    if (it == g_offers.end()) return;
+    const OfferInfo& inf = it->second;
+    const char* mime = inf.utf8 ? "text/plain;charset=utf-8" : inf.plain ? "text/plain"
+                     : inf.utf8str ? "UTF8_STRING" : inf.str ? "STRING" : nullptr;
+    if (!mime) return;
+    int fds[2];
+    if (pipe2(fds, O_CLOEXEC) < 0) return;
+    wl_data_offer_receive(g_clip, mime, fds[1]);
+    wl_display_flush(g_wl);
+    close(fds[1]);
+    std::string data;
+    char buf[4096];
+    int64_t deadline = NowMs() + 1500;
+    for (;;) {
+        int64_t left = deadline - NowMs();
+        if (left <= 0) break;
+        pollfd pfd = {fds[0], POLLIN, 0};
+        int r = poll(&pfd, 1, (int)left);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        ssize_t n = read(fds[0], buf, sizeof buf);
+        if (n <= 0) break;
+        data.append(buf, (size_t)n);
+        if (data.size() > (1u << 20)) break;
+    }
+    close(fds[0]);
+    PasteText(data);
+    g_needRedraw = g_extra = true;
+}
+
+// ---------- คีย์บอร์ด (xkbcommon) ----------
+static xkb_context* g_xkbCtx = nullptr;
+static xkb_keymap*  g_xkbMap = nullptr;
+static xkb_state*   g_xkbState = nullptr;
+static wl_keyboard* g_kb = nullptr;
+static uint32_t g_repKey = 0;                 // 0 = ไม่มีปุ่มที่กำลังกดค้าง
+static xkb_keysym_t g_repSym = 0;
+static std::string g_repText;
+static int64_t g_repNext = 0;
+static int g_repRate = 25, g_repDelay = 400;  // ค่าเริ่มต้น (compositor ส่ง repeat_info มาทับ)
+
+static bool ModActive(const char* name) {
+    return g_xkbState && xkb_state_mod_name_is_active(g_xkbState, name, XKB_STATE_MODS_EFFECTIVE) > 0;
+}
+static bool ShiftDown() { return ModActive(XKB_MOD_NAME_SHIFT); }
+static bool CtrlDown()  { return ModActive(XKB_MOD_NAME_CTRL); }
+
+static void HandleKey(xkb_keysym_t ks, const std::string& text) {
+    g_needRedraw = g_extra = true;
+    if (ks == XKB_KEY_Escape) g_escape = true;
+    else if (ks == XKB_KEY_Return || ks == XKB_KEY_KP_Enter) g_enter = true;
+    else if (ks == XKB_KEY_Tab) FocusNext(false);
+    else if (ks == XKB_KEY_ISO_Left_Tab) FocusNext(true);
+    else if (ks == XKB_KEY_BackSpace) { if (g_screen == S_CALC) CalcDelete(); else if (g_focusStr && !g_focusStr->empty()) g_focusStr->pop_back(); }
+    else if (ks == XKB_KEY_Delete) { if (g_screen == S_CALC) CalcClear(); else if (g_focusStr) g_focusStr->clear(); }
+    else if (ks == XKB_KEY_Up) g_wheelKey = -1;
+    else if (ks == XKB_KEY_Down) g_wheelKey = 1;
+    else if (ks == XKB_KEY_Left) g_hKey = -1;
+    else if (ks == XKB_KEY_Right) g_hKey = 1;
+    else if (CtrlDown() && (ks == XKB_KEY_v || ks == XKB_KEY_V)) RequestPaste();
+    else if (ks == XKB_KEY_Insert && ShiftDown()) RequestPaste();
+    else if (ks == XKB_KEY_Prior) g_wheelKey = -8;
+    else if (ks == XKB_KEY_Next) g_wheelKey = 8;
+    else if (!CtrlDown() && text.size() == 1 && isprint((unsigned char)text[0])) TypeChar(text[0]);
+}
+static void KbKeymap(void*, wl_keyboard*, uint32_t format, int32_t fd, uint32_t size) {
+    if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) { close(fd); return; }
+    char* map = (char*)mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map == MAP_FAILED) { close(fd); return; }
+    xkb_keymap* km = xkb_keymap_new_from_string(g_xkbCtx, map, XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
+    munmap(map, size);
+    close(fd);
+    if (!km) return;
+    xkb_state* st = xkb_state_new(km);
+    if (!st) { xkb_keymap_unref(km); return; }
+    if (g_xkbState) xkb_state_unref(g_xkbState);
+    if (g_xkbMap) xkb_keymap_unref(g_xkbMap);
+    g_xkbMap = km; g_xkbState = st;
+}
+static void KbEnter(void*, wl_keyboard*, uint32_t, wl_surface*, wl_array*) { g_needRedraw = true; }
+static void KbLeave(void*, wl_keyboard*, uint32_t, wl_surface*) { g_repKey = 0; }
+static void KbKey(void*, wl_keyboard*, uint32_t, uint32_t, uint32_t key, uint32_t state) {
+    if (!g_xkbState || !g_xkbMap) return;
+    xkb_keycode_t code = key + 8;
+    if (state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+        xkb_keysym_t sym = xkb_state_key_get_one_sym(g_xkbState, code);
+        char buf[16];
+        int n = xkb_state_key_get_utf8(g_xkbState, code, buf, sizeof buf);
+        std::string text = (n > 0 && n < (int)sizeof buf) ? std::string(buf, (size_t)n) : std::string();
+        HandleKey(sym, text);
+        if (g_repRate > 0 && xkb_keymap_key_repeats(g_xkbMap, code)) {
+            g_repKey = key; g_repSym = sym; g_repText = text; g_repNext = NowMs() + g_repDelay;
+        }
+    } else if (key == g_repKey) {
+        g_repKey = 0;
+    }
+}
+static void KbModifiers(void*, wl_keyboard*, uint32_t, uint32_t dep, uint32_t lat, uint32_t loc, uint32_t grp) {
+    if (g_xkbState) xkb_state_update_mask(g_xkbState, dep, lat, loc, 0, 0, grp);
+}
+static void KbRepeatInfo(void*, wl_keyboard*, int32_t rate, int32_t delay) { g_repRate = rate; g_repDelay = delay; }
+static const wl_keyboard_listener g_kbListener = { KbKeymap, KbEnter, KbLeave, KbKey, KbModifiers, KbRepeatInfo };
+
+// Wayland ไม่ทำ auto-repeat ให้ — จำลองเองเหมือนที่ X server เคยทำ
+static int RepeatTimeoutMs() {
+    if (!g_repKey || g_repRate <= 0) return -1;
+    int64_t d = g_repNext - NowMs();
+    return d < 0 ? 0 : (int)d;
+}
+static void RepeatTick() {
+    if (!g_repKey || g_repRate <= 0) return;
+    int64_t now = NowMs(), period = std::max(1, 1000 / g_repRate);
+    for (int guard = 0; g_repKey && now >= g_repNext && guard < 5; ++guard) {
+        HandleKey(g_repSym, g_repText);
+        g_repNext += period;
+    }
+    if (g_repKey && now >= g_repNext) g_repNext = now + period;
+}
+
+// ---------- เมาส์ ----------
+static wl_pointer* g_ptr = nullptr;
+static bool g_ptrFocus = false;               // เมาส์อยู่บนพื้นที่เนื้อหา (ไม่ใช่ขอบหน้าต่างของ libdecor)
+static uint32_t g_ptrSerial = 0;
+static wl_surface* g_cursorSurf = nullptr;
+static wl_cursor_image* g_cursorImg = nullptr;
+static double g_axisAcc[2] = {0, 0};
+static int g_axisDisc[2] = {0, 0};
+
+static void SetCursor(wl_pointer* p) {
+    if (g_cursorSurf && g_cursorImg)
+        wl_pointer_set_cursor(p, g_ptrSerial, g_cursorSurf, (int32_t)g_cursorImg->hotspot_x, (int32_t)g_cursorImg->hotspot_y);
+}
+static void PtrEnter(void*, wl_pointer* p, uint32_t serial, wl_surface* s, wl_fixed_t sx, wl_fixed_t sy) {
+    g_ptrFocus = (s == g_surf);
+    if (!g_ptrFocus) return;
+    g_ptrSerial = serial;
+    ui.mx = wl_fixed_to_int(sx); ui.my = wl_fixed_to_int(sy);
+    SetCursor(p);
+    g_needRedraw = true;
+}
+static void PtrLeave(void*, wl_pointer*, uint32_t, wl_surface* s) { if (s == g_surf) g_ptrFocus = false; }
+static void PtrMotion(void*, wl_pointer*, uint32_t, wl_fixed_t sx, wl_fixed_t sy) {
+    if (!g_ptrFocus) return;
+    ui.mx = wl_fixed_to_int(sx); ui.my = wl_fixed_to_int(sy);
+    g_needRedraw = true;
+}
+static void PtrButton(void*, wl_pointer*, uint32_t, uint32_t, uint32_t button, uint32_t state) {
+    if (!g_ptrFocus) return;
+    bool down = (state == WL_POINTER_BUTTON_STATE_PRESSED);
+    if (button == BTN_LEFT) {
+        if (down) ui.down = ui.pressed = true;
+        else { ui.down = false; ui.released = true; g_extra = true; }
+    } else if (button == BTN_MIDDLE && down) {
+        RequestPaste();       // X11 เดิมวาง PRIMARY; Wayland แกนหลักไม่มี primary selection จึงวางคลิปบอร์ดแทน
+    }
+    g_needRedraw = true;
+}
+static void FlushAxis() {
+    int step[2] = {0, 0};
+    for (int a = 0; a < 2; ++a) {
+        if (g_axisDisc[a]) step[a] = g_axisDisc[a] > 0 ? 1 : -1;
+        else if (g_axisAcc[a] >= 10.0 || g_axisAcc[a] <= -10.0) step[a] = g_axisAcc[a] > 0 ? 1 : -1;
+        if (step[a]) g_axisAcc[a] = 0;
+        g_axisDisc[a] = 0;
+    }
+    if (step[0]) { if (ShiftDown()) g_wheelH = step[0]; else g_wheel = step[0]; }
+    if (step[1]) g_wheelH = step[1];
+    if (step[0] || step[1]) g_needRedraw = true;
+}
+static void PtrAxis(void* , wl_pointer* p, uint32_t, uint32_t axis, wl_fixed_t value) {
+    if (!g_ptrFocus || axis > 1) return;
+    g_axisAcc[axis] += wl_fixed_to_double(value);
+    if (wl_pointer_get_version(p) < 5) FlushAxis();       // ไม่มี event frame ใน wl_pointer เวอร์ชันเก่า
+}
+static void PtrFrame(void*, wl_pointer*) { if (g_ptrFocus) FlushAxis(); else { g_axisDisc[0] = g_axisDisc[1] = 0; } }
+static void PtrAxisSource(void*, wl_pointer*, uint32_t) {}
+static void PtrAxisStop(void*, wl_pointer*, uint32_t, uint32_t axis) { if (axis < 2) g_axisAcc[axis] = 0; }
+static void PtrAxisDiscrete(void*, wl_pointer*, uint32_t axis, int32_t discrete) { if (axis < 2) g_axisDisc[axis] += discrete; }
+static const wl_pointer_listener g_ptrListener = { PtrEnter, PtrLeave, PtrMotion, PtrButton, PtrAxis, PtrFrame,
+                                                   PtrAxisSource, PtrAxisStop, PtrAxisDiscrete };
+
+static void SetupCursor() {
+    int size = 24;
+    if (const char* s = getenv("XCURSOR_SIZE")) { int v = atoi(s); if (v > 0) size = v; }
+    wl_cursor_theme* th = wl_cursor_theme_load(getenv("XCURSOR_THEME"), size, g_shm);
+    if (!th) return;
+    wl_cursor* c = wl_cursor_theme_get_cursor(th, "left_ptr");
+    if (!c) c = wl_cursor_theme_get_cursor(th, "default");
+    if (!c || c->image_count == 0) return;
+    g_cursorImg = c->images[0];
+    g_cursorSurf = wl_compositor_create_surface(g_compositor);
+    wl_surface_attach(g_cursorSurf, wl_cursor_image_get_buffer(g_cursorImg), 0, 0);
+    wl_surface_damage(g_cursorSurf, 0, 0, (int32_t)g_cursorImg->width, (int32_t)g_cursorImg->height);
+    wl_surface_commit(g_cursorSurf);
+}
+
+// ---------- seat / registry ----------
+static void SeatCaps(void*, wl_seat* seat, uint32_t caps) {
+    if ((caps & WL_SEAT_CAPABILITY_POINTER) && !g_ptr) {
+        g_ptr = wl_seat_get_pointer(seat);
+        wl_pointer_add_listener(g_ptr, &g_ptrListener, nullptr);
+    } else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && g_ptr) {
+        if (wl_pointer_get_version(g_ptr) >= 3) wl_pointer_release(g_ptr); else wl_pointer_destroy(g_ptr);
+        g_ptr = nullptr; g_ptrFocus = false;
+    }
+    if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !g_kb) {
+        g_kb = wl_seat_get_keyboard(seat);
+        wl_keyboard_add_listener(g_kb, &g_kbListener, nullptr);
+    } else if (!(caps & WL_SEAT_CAPABILITY_KEYBOARD) && g_kb) {
+        if (wl_keyboard_get_version(g_kb) >= 3) wl_keyboard_release(g_kb); else wl_keyboard_destroy(g_kb);
+        g_kb = nullptr; g_repKey = 0;
+    }
+}
+static void SeatName(void*, wl_seat*, const char*) {}
+static const wl_seat_listener g_seatListener = { SeatCaps, SeatName };
+
+static void RegGlobal(void*, wl_registry* reg, uint32_t name, const char* iface, uint32_t ver) {
+    if (!strcmp(iface, wl_compositor_interface.name))
+        g_compositor = (wl_compositor*)wl_registry_bind(reg, name, &wl_compositor_interface, std::min(ver, 4u));
+    else if (!strcmp(iface, wl_shm_interface.name))
+        g_shm = (wl_shm*)wl_registry_bind(reg, name, &wl_shm_interface, 1);
+    else if (!strcmp(iface, wl_seat_interface.name) && !g_seat) {
+        g_seat = (wl_seat*)wl_registry_bind(reg, name, &wl_seat_interface, std::min(ver, 5u));
+        wl_seat_add_listener(g_seat, &g_seatListener, nullptr);
+    } else if (!strcmp(iface, wl_data_device_manager_interface.name))
+        g_ddm = (wl_data_device_manager*)wl_registry_bind(reg, name, &wl_data_device_manager_interface, std::min(ver, 3u));
+}
+static void RegGlobalRemove(void*, wl_registry*, uint32_t) {}
+static const wl_registry_listener g_regListener = { RegGlobal, RegGlobalRemove };
+
+// ---------- หน้าต่าง (libdecor = ไตเติลบาร์/ขอบ/ย่อขยาย ที่ใช้ได้ทุก compositor) ----------
+static void DecError(libdecor*, enum libdecor_error err, const char* msg) {
+    fprintf(stderr, "libdecor error %d: %s\n", (int)err, msg);
+    g_running = false;
+}
+static libdecor_interface g_decIface = { DecError };
+
+static const int W0 = 1040, H0 = 800, MINW = 940, MINH = 700;
+static void FrameConfigure(libdecor_frame* frame, libdecor_configuration* config, void*) {
+    int w = 0, h = 0;
+    if (!libdecor_configuration_get_content_size(config, frame, &w, &h) || w <= 0 || h <= 0) {
+        w = g_w > 0 ? g_w : W0;
+        h = g_h > 0 ? g_h : H0;
+    }
+    if (w != g_w || h != g_h || !g_px) CreateBuffer(w, h);
+    libdecor_state* st = libdecor_state_new(w, h);
+    libdecor_frame_commit(frame, st, config);
+    libdecor_state_free(st);
+    g_configured = true;
+    g_needRedraw = true;
+}
+static void FrameClose(libdecor_frame*, void*) { g_running = false; }
+static void FrameCommit(libdecor_frame*, void*) { if (g_surf) wl_surface_commit(g_surf); }
+static void FrameDismissPopup(libdecor_frame*, const char*, void*) {}
+static libdecor_frame_interface g_frameIface = { FrameConfigure, FrameClose, FrameCommit, FrameDismissPopup };
+
+int main_gui() {
+    g_wl = wl_display_connect(nullptr);
+    if (!g_wl) {
+        fprintf(stderr, "Cannot connect to a Wayland display (is WAYLAND_DISPLAY set? are you in a Wayland session?)\n");
+        return 1;
+    }
+    g_registry = wl_display_get_registry(g_wl);
+    wl_registry_add_listener(g_registry, &g_regListener, nullptr);
+    wl_display_roundtrip(g_wl);
+    if (!g_compositor || !g_shm) { fprintf(stderr, "Compositor lacks wl_compositor / wl_shm\n"); return 1; }
+
+    g_xkbCtx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    if (g_ddm && g_seat) {
+        g_dataDev = wl_data_device_manager_get_data_device(g_ddm, g_seat);
+        wl_data_device_add_listener(g_dataDev, &g_ddListener, nullptr);
+    }
+    SetupCursor();
+    wl_display_roundtrip(g_wl);      // รับ capabilities ของ seat
+    wl_display_roundtrip(g_wl);      // รับ keymap / repeat_info
+
+    InitFonts();
     BuildCatalog();
     CreateBuffer(W0, H0);
-    XMapWindow(g_dpy, g_win);
+    if (!g_running) return 1;
 
-    bool running = true;
-    while (running) {
-        XEvent e;
-        XNextEvent(g_dpy, &e);
-        bool extra = false;
-        switch (e.type) {
-        case ConfigureNotify:
-            if (e.xconfigure.width != g_w || e.xconfigure.height != g_h) CreateBuffer(e.xconfigure.width, e.xconfigure.height);
-            break;
-        case MotionNotify: ui.mx = e.xmotion.x; ui.my = e.xmotion.y; break;
-        case ButtonPress:
-            ui.mx = e.xbutton.x; ui.my = e.xbutton.y;
-            if (e.xbutton.button == Button1) ui.down = ui.pressed = true;
-            else if (e.xbutton.button == Button2) { RequestPaste(XA_PRIMARY); }
-            else if (e.xbutton.button == Button4) { if (e.xbutton.state & ShiftMask) g_wheelH = -1; else g_wheel = -1; }
-            else if (e.xbutton.button == Button5) { if (e.xbutton.state & ShiftMask) g_wheelH = 1; else g_wheel = 1; }
-            else if (e.xbutton.button == 6) g_wheelH = -1;
-            else if (e.xbutton.button == 7) g_wheelH = 1;
-            break;
-        case ButtonRelease:
-            if (e.xbutton.button == Button1) { ui.mx = e.xbutton.x; ui.my = e.xbutton.y; ui.down = false; ui.released = true; extra = true; }
-            break;
-        case KeyPress: {
-            char buf[16];
-            KeySym ks = NoSymbol;
-            int n = XLookupString(&e.xkey, buf, sizeof buf - 1, &ks, nullptr);
-            extra = true;
-            if (ks == XK_Escape) g_escape = true;
-            else if (ks == XK_Return || ks == XK_KP_Enter) g_enter = true;
-            else if (ks == XK_Tab) FocusNext(false);
-            else if (ks == XK_ISO_Left_Tab) FocusNext(true);
-            else if (ks == XK_BackSpace) { if (g_screen == S_CALC) CalcDelete(); else if (g_focusStr && !g_focusStr->empty()) g_focusStr->pop_back(); }
-            else if (ks == XK_Delete) { if (g_screen == S_CALC) CalcClear(); else if (g_focusStr) g_focusStr->clear(); }
-            else if (ks == XK_Up) g_wheelKey = -1;
-            else if (ks == XK_Down) g_wheelKey = 1;
-            else if (ks == XK_Left) g_hKey = -1;
-            else if (ks == XK_Right) g_hKey = 1;
-            else if ((e.xkey.state & ControlMask) && (ks == XK_v || ks == XK_V)) RequestPaste(g_atomClip);
-            else if (ks == XK_Insert && (e.xkey.state & ShiftMask)) RequestPaste(g_atomClip);
-            else if (ks == XK_Prior) g_wheelKey = -8;
-            else if (ks == XK_Next) g_wheelKey = 8;
-            else if (n == 1 && isprint((unsigned char)buf[0])) TypeChar(buf[0]);
-            break;
-        }
-        case SelectionNotify: HandleSelection(e.xselection); extra = true; break;
-        case ClientMessage:
-            if ((Atom)e.xclient.data.l[0] == wmDelete) running = false;
-            break;
-        }
-        if (running && XPending(g_dpy) == 0) {
+    g_surf = wl_compositor_create_surface(g_compositor);
+    g_dec = libdecor_new(g_wl, &g_decIface);
+    if (!g_dec) { fprintf(stderr, "libdecor_new failed\n"); return 1; }
+    g_frame = libdecor_decorate(g_dec, g_surf, &g_frameIface, nullptr);
+    if (!g_frame) { fprintf(stderr, "libdecor_decorate failed\n"); return 1; }
+    libdecor_frame_set_app_id(g_frame, "maths-solver");
+    libdecor_frame_set_title(g_frame, "Maths Solver System");
+    libdecor_frame_set_min_content_size(g_frame, MINW, MINH);
+    libdecor_frame_map(g_frame);
+
+    while (g_running) {
+        if (libdecor_dispatch(g_dec, RepeatTimeoutMs()) < 0) break;
+        wl_display_dispatch_pending(g_wl);
+        RepeatTick();
+        if (g_running && g_configured && g_needRedraw) {
+            bool extra = g_extra;
+            g_needRedraw = g_extra = false;
             Present();
             if (extra) Present();      // วาดซ้ำเพื่อให้เห็นผลของการคลิก/พิมพ์ทันที
         }
     }
-    if (g_img) XDestroyImage(g_img);
-    if (g_fontL && g_fontL != g_fontS) XFreeFont(g_dpy, g_fontL);
-    if (g_fontM && g_fontM != g_fontS) XFreeFont(g_dpy, g_fontM);
-    if (g_fontS) XFreeFont(g_dpy, g_fontS);
-    XFreeGC(g_dpy, g_gc);
-    XDestroyWindow(g_dpy, g_win);
-    XCloseDisplay(g_dpy);
+
+    DestroyOffer(g_clip);
+    DestroyOffer(g_dndOffer);
+    DestroyBuffers();
+    if (g_xkbState) xkb_state_unref(g_xkbState);
+    if (g_xkbMap) xkb_keymap_unref(g_xkbMap);
+    if (g_xkbCtx) xkb_context_unref(g_xkbCtx);
+    if (g_frame) libdecor_frame_unref(g_frame);
+    if (g_dec) libdecor_unref(g_dec);
+    if (g_surf) wl_surface_destroy(g_surf);
+    wl_display_disconnect(g_wl);
     return 0;
 }
